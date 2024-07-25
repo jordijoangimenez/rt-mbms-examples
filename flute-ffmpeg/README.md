@@ -50,6 +50,13 @@ sudo apt install libpistache-dev
 
 ````
 git clone --recurse-submodules https://github.com/5G-MAG/rt-mbms-examples
+````
+
+### Clone the rt-libflute repository inside the lib folder
+
+````
+cd rt-mbms-examples/lib
+git clone --recurse-submodules https://github.com/5G-MAG/rt-libflute
 ```` 
 
 ### Build setup
