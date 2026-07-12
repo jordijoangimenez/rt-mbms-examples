@@ -45,7 +45,7 @@ This reads the portal host/port and Basic-auth credentials from
 Either way it **only creates** the service/session — it does **not** start
 broadcasting. Open the xMB tab, review, and hit **Activate** to go live.
 
-Prerequisites: the stack is up (`./launch-all.sh`), the portal is reachable on
+Prerequisites: the stack is up (`./transmit.sh`), the portal is reachable on
 `:8080`, the BM-SC's xMB indicator is green (`:8543`), and — for an HTTPS/CDN
 source like `rtve-24h.json` — `hls-http-proxy.js` is running (see above).
 

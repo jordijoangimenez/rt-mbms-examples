@@ -9,7 +9,7 @@
 #   sudo ./receive-netns.sh stop      # tear it down
 #
 # Topology:
-#   root netns : srsepc, srsenb (ZMQ TX on tcp://*:2000), mbms-gw, bmsc   -> run via ./launch-all.sh --transmit-only
+#   root netns : srsepc, srsenb (ZMQ TX on tcp://*:2000), mbms-gw, bmsc   -> run via ./transmit.sh
 #   mbms-rx    : modem (ZMQ RX), client, application (:3000)
 #   veth: 10.80.0.1 (root) <-> 10.80.0.2 (mbms-rx). The modem connects its ZMQ
 #         RX to tcp://10.80.0.1:2000 (the eNB TX, which binds all interfaces).

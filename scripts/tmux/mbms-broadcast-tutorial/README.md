@@ -43,21 +43,26 @@ Control:   application-provider (portal, :8080)
 
 ## Usage
 
-Two ways to bring the whole chain up:
+Two ways to bring the stack up:
 
-**A. Background launcher (simplest, no tmux) — good for a demo:**
+**A. Background launcher (simplest, no tmux) — transmit side only, good for a demo:**
 
 ```bash
-./launch-all.sh          # start the whole chain in the background
-./launch-all.sh --stop   # stop everything it started (incl. the root srsepc)
+./transmit.sh             # start EPC + eNB + MBMS-GW + BM-SC + Portal in the background
+./transmit.sh --stop      # stop everything it started (incl. the root srsepc)
+sudo ./receive-netns.sh start   # modem + client + application, in their own netns (see below)
 ```
 
 Each component runs backgrounded with its own log under
 `~/.local/state/mbms-broadcast-tutorial/<Name>.log`. It authenticates sudo once
-(for the EPC), clears a leftover `srsepc`, warns on already-bound ports, and
-sets `SOAPY_SDR_PLUGIN_PATH` for the modem.
+(for the EPC), clears a leftover `srsepc`, and warns on already-bound ports.
+`transmit.sh` only runs the transmit side — see
+[Full chain on one host](#full-chain-on-one-host-receive-side-in-a-network-namespace)
+below for the receive side, which always needs its own network namespace on a
+single-host demo (UDP `:2153` would otherwise collide with the eNB's own
+receiver).
 
-**B. tmux tutorial (one visible window per function)** — needs `tmux`
+**B. tmux tutorial (one visible window per function, whole chain in one namespace)** — needs `tmux`
 (`sudo apt install tmux`):
 
 ```bash
@@ -144,7 +149,7 @@ host the eNB's M1-U receiver and the client's content receiver both want UDP
 in its own network namespace with `receive-netns.sh` (needs sudo):
 
 ```bash
-./launch-all.sh --transmit-only        # EPC + eNB + MBMS-GW + BM-SC (root netns)
+./transmit.sh                          # EPC + eNB + MBMS-GW + BM-SC + Portal (root netns)
 sudo ./receive-netns.sh start          # modem + client + application in netns "mbms-rx"
 ```
 
@@ -163,7 +168,7 @@ Drive content as usual from the portal (`:8080`, transmit side): start
 
 ```bash
 sudo ./receive-netns.sh stop
-./launch-all.sh --stop
+./transmit.sh --stop
 ```
 
 Note: netns + veth needs root and can't be exercised in every environment, so if
