@@ -6,3 +6,4 @@ soapy-zmq-bridge/
 *.log
 *.crash
 conf/*.state
+tools/ul-feeder
