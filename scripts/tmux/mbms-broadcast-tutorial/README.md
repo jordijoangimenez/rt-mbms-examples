@@ -8,6 +8,12 @@ per-window logging. It is the LTE-broadcast analogue of
 By default it runs the **software-radio (ZeroMQ)** end-to-end setup, so no SDR
 hardware is required.
 
+**New to this lab?** [`TUTORIAL.html`](TUTORIAL.html) in this same directory is a
+full from-scratch walkthrough -- all ten repos, build order, the `zmqrx` bridge
+source in full, every config step, and every gotcha actually hit standing this up.
+Open it in a browser. This README below assumes the stack already builds and
+covers day-to-day usage of the launcher scripts themselves.
+
 ## What it starts (in dependency order)
 
 ```
@@ -119,23 +125,162 @@ through a **SoapySDR module that registers a `zmqrx` driver** (see
 which connects to the eNB's ZeroMQ transmitter and presents the samples as an SDR
 receive device.
 
-This bridge is **not shipped with the tutorial** — build (or supply) it yourself:
+This bridge is **not shipped with the tutorial** — build it yourself. The eNB's ZMQ TX
+(`enb_baseline.conf`'s `tx_type=pub`) is a `ZMQ_PUB` socket that free-runs, broadcasting raw
+interleaved complex-float32 I/Q bursts with no framing (see srsRAN's own
+`rf_zmq_imp_tx.c`/`_rf_zmq_tx_baseband`). The bridge just needs to be the matching `ZMQ_SUB`
+side, draining it into a ring buffer from a background thread the same way srsRAN's own
+reference receiver (`rf_zmq_imp_rx.c`/`rf_zmq_async_rx_thread`) does — a `ZMQ_REQ`/`REP`
+request-burst pattern will **not** work here; ZMQ enforces compatible socket-type pairs and a
+`REQ` socket cannot connect to a `PUB` socket at all.
 
 1. Install the dev packages: `sudo apt install libsoapysdr-dev libzmq3-dev`.
-2. Provide a SoapySDR out-of-tree module that registers the `zmqrx` driver (a
-   `SoapySDR::Registry("zmqrx", …)` device that reads I/Q from the eNB's ZeroMQ
-   `rx_port`) and build it to `libzmqrxSupport.so`, e.g.:
-   ```bash
-   g++ -std=c++17 -shared -fPIC ZmqRxDevice.cpp -o libzmqrxSupport.so \
-     $(pkg-config --cflags --libs SoapySDR libzmq)
+2. Save the following as `~/soapy-zmq-bridge/SoapyZmqBridge.cpp`:
+
+   ```cpp
+   // Minimal SoapySDR device plugin bridging srsenb's ZMQ_PUB TX output into
+   // rt-mbms-modem's usual SoapySDR::Device::make() radio path.
+   #include <SoapySDR/Device.hpp>
+   #include <SoapySDR/Registry.hpp>
+   #include <SoapySDR/Logger.hpp>
+   #include <zmq.h>
+   #include <atomic>
+   #include <chrono>
+   #include <complex>
+   #include <condition_variable>
+   #include <mutex>
+   #include <thread>
+   #include <vector>
+
+   namespace { constexpr size_t kRingCapacitySamples = 3072000; } // 10 subframes @ 20 MHz
+
+   class SoapyZmqBridge : public SoapySDR::Device {
+   public:
+       explicit SoapyZmqBridge(const SoapySDR::Kwargs &args) : _ring(kRingCapacitySamples) {
+           std::string endpoint = "tcp://127.0.0.1:2000";
+           auto it = args.find("rx_port");
+           if (it == args.end()) it = args.find("endpoint");
+           if (it != args.end()) endpoint = it->second;
+           _ctx = zmq_ctx_new();
+           _sock = zmq_socket(_ctx, ZMQ_SUB);
+           zmq_setsockopt(_sock, ZMQ_SUBSCRIBE, "", 0);
+           int timeout_ms = 100;
+           zmq_setsockopt(_sock, ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
+           zmq_connect(_sock, endpoint.c_str());
+           _running = true;
+           _rxThread = std::thread(&SoapyZmqBridge::rxThreadBody, this);
+       }
+       ~SoapyZmqBridge() override {
+           _running = false;
+           if (_rxThread.joinable()) _rxThread.join();
+           if (_sock) zmq_close(_sock);
+           if (_ctx) zmq_ctx_destroy(_ctx);
+       }
+       std::string getDriverKey(void) const override { return "zmqrx"; }
+       std::string getHardwareKey(void) const override { return "ZmqRx"; }
+       size_t getNumChannels(const int d) const override { return d == SOAPY_SDR_RX ? 1 : 0; }
+       std::vector<std::string> listAntennas(const int, const size_t) const override { return {"RX"}; }
+       void setAntenna(const int, const size_t, const std::string &) override {}
+       std::string getAntenna(const int, const size_t) const override { return "RX"; }
+       bool hasGainMode(const int, const size_t) const override { return true; }
+       void setGainMode(const int, const size_t, const bool) override {}
+       void setGain(const int, const size_t, const double) override {}
+       void setGain(const int, const size_t, const std::string &, const double) override {}
+       void setFrequency(const int, const size_t, const double f, const SoapySDR::Kwargs &) override { _freq = f; }
+       double getFrequency(const int, const size_t) const override { return _freq; }
+       void setBandwidth(const int, const size_t, const double bw) override { _bw = bw; }
+       double getBandwidth(const int, const size_t) const override { return _bw; }
+       void setSampleRate(const int, const size_t, const double r) override { _rate = r; }
+       double getSampleRate(const int, const size_t) const override { return _rate; }
+       std::vector<double> listSampleRates(const int, const size_t) const override { return {_rate}; }
+       SoapySDR::Stream *setupStream(const int d, const std::string &fmt,
+                                     const std::vector<size_t> &, const SoapySDR::Kwargs &) override {
+           if (d != SOAPY_SDR_RX || fmt != "CF32") return nullptr;
+           return reinterpret_cast<SoapySDR::Stream *>(this);
+       }
+       void closeStream(SoapySDR::Stream *) override {}
+       int activateStream(SoapySDR::Stream *, const int, const long long, const size_t) override { return 0; }
+       int deactivateStream(SoapySDR::Stream *, const int, const long long) override { return 0; }
+       int readStream(SoapySDR::Stream *, void *const *buffs, const size_t numElems,
+                       int &flags, long long &timeNs, const long timeoutUs) override {
+           flags = 0; timeNs = 0;
+           auto *out = reinterpret_cast<std::complex<float> *>(buffs[0]);
+           std::unique_lock<std::mutex> lock(_ring.mutex);
+           if (_ring.count == 0)
+               _ring.cv.wait_for(lock, std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 100000),
+                                  [this] { return _ring.count > 0 || !_running; });
+           size_t take = std::min(_ring.count, numElems);
+           for (size_t i = 0; i < take; ++i) {
+               out[i] = _ring.buf[_ring.head];
+               _ring.head = (_ring.head + 1) % _ring.buf.size();
+           }
+           _ring.count -= take;
+           return take == 0 ? SOAPY_SDR_TIMEOUT : static_cast<int>(take);
+       }
+   private:
+       struct Ring {
+           explicit Ring(size_t c) : buf(c) {}
+           std::vector<std::complex<float>> buf;
+           size_t head = 0, tail = 0, count = 0;
+           std::mutex mutex; std::condition_variable cv;
+       };
+       void rxThreadBody() {
+           std::vector<uint8_t> rxbuf(1 << 20);
+           while (_running) {
+               int n = zmq_recv(_sock, rxbuf.data(), rxbuf.size(), 0);
+               if (n < 0) continue; // ZMQ_RCVTIMEO expiry -- normal idle case
+               if (static_cast<size_t>(n) == rxbuf.size()) rxbuf.resize(rxbuf.size() * 2);
+               size_t nsamples = static_cast<size_t>(n) / sizeof(std::complex<float>);
+               if (nsamples == 0) continue;
+               auto *samples = reinterpret_cast<std::complex<float> *>(rxbuf.data());
+               std::lock_guard<std::mutex> lock(_ring.mutex);
+               for (size_t i = 0; i < nsamples; ++i) {
+                   if (_ring.count == _ring.buf.size()) { _ring.head = (_ring.head + 1) % _ring.buf.size(); --_ring.count; }
+                   _ring.buf[_ring.tail] = samples[i];
+                   _ring.tail = (_ring.tail + 1) % _ring.buf.size();
+                   ++_ring.count;
+               }
+               _ring.cv.notify_one();
+           }
+       }
+       void *_ctx = nullptr; void *_sock = nullptr;
+       double _freq = 0, _bw = 0, _rate = 15360000.0;
+       std::atomic<bool> _running{false};
+       std::thread _rxThread;
+       Ring _ring;
+   };
+
+   static SoapySDR::KwargsList findZmqBridge(const SoapySDR::Kwargs &) {
+       SoapySDR::Kwargs args; args["driver"] = "zmqrx"; args["label"] = "ZMQ RX Bridge to srsenb";
+       return {args};
+   }
+   static SoapySDR::Device *makeZmqBridge(const SoapySDR::Kwargs &args) { return new SoapyZmqBridge(args); }
+   static SoapySDR::Registry registerZmqBridge("zmqrx", &findZmqBridge, &makeZmqBridge, SOAPY_SDR_ABI_VERSION);
    ```
-3. Point the launcher at the directory holding `libzmqrxSupport.so`:
+
+3. Build and install it:
+   ```bash
+   cd ~/soapy-zmq-bridge
+   g++ -std=c++17 -shared -fPIC -O2 SoapyZmqBridge.cpp -o libzmqrxSupport.so \
+     $(pkg-config --cflags --libs SoapySDR) $(pkg-config --cflags --libs libzmq) -lpthread
+   sudo cp libzmqrxSupport.so "$(pkg-config --variable=libdir SoapySDR)/SoapySDR/modules0.8/libzmqrxSupport.so"
+   SoapySDRUtil --info | grep "Available factories"   # -> should list zmqrx
+   ```
+4. Point the launcher at the directory holding `libzmqrxSupport.so` (only needed if you didn't
+   install it into SoapySDR's own module path above):
    ```bash
    SOAPY_ZMQ_DIR=/path/to/your/bridge ./mbms-broadcast-tutorial.sh
    # (or export SOAPY_SDR_PLUGIN_PATH; default is ~/soapy-zmq-bridge)
    ```
    The script exports `SOAPY_SDR_PLUGIN_PATH` for the Modem window; preflight
    warns if the module is missing.
+
+Before wiring this into the full stack, it's worth confirming the bridge actually receives real
+bytes in isolation: bind a throwaway `ZMQ_PUB` publisher (a few lines of Python with `pyzmq`,
+sending periodic `complex64` bursts on `tcp://*:2000`) and call `SoapySDR::Device::make()` +
+`readStream()` against `driver=zmqrx` directly, checking for non-zero sample counts with values
+in the expected range. This isolates a broken bridge from a broken eNB/modem config before
+they're stacked together.
 
 **Prefer a real SDR?** Set the eNB `device_name`/`device_args` for your radio
 (UHD / BladeRF / SoapySDR) in `conf/enb_baseline.conf`, drop the modem's `zmqrx`
