@@ -98,6 +98,9 @@ start() {
   echo "Starting receive chain in netns '$NS' (eNB TX expected at ${ROOT_IP}:${ZMQ_PORT}) ..."
   # The modem samples the full 10 MHz carrier (-b 10), reads the CAS from the MIB,
   # and learns the (narrower) PMCH bandwidth from SIB13 -- so no PRB override here.
+  # For the n_prb=25 PMCH BLER investigation (see
+  # rt-mbms-modem/docs/KNOWN_ISSUES.md), set MCH_SF5_DIAG=1 and/or
+  # SCS_TIMING_DIAG=1 in the environment before running this script.
   nsrun_root Modem  "$CONF"    "'$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
 
   # The modem creates $TUN_DEV but leaves it DOWN with no address. Wait for it,
