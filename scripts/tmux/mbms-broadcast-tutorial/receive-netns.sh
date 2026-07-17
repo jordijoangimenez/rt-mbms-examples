@@ -99,9 +99,25 @@ start() {
   # The modem samples the full 10 MHz carrier (-b 10), reads the CAS from the MIB,
   # and learns the (narrower) PMCH bandwidth from SIB13 -- so no PRB override here.
   # For the n_prb=25 PMCH BLER investigation (see
-  # rt-mbms-modem/docs/KNOWN_ISSUES.md), set MCH_SF5_DIAG=1 and/or
+  # rt-mbms-modem/KNOWN_ISSUES.md), set MCH_DIAG=1 and/or
   # SCS_TIMING_DIAG=1 in the environment before running this script.
-  nsrun_root Modem  "$CONF"    "'$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
+  #
+  # 2026-07-16: dropped SYNC_ERR_DIAG, RACE_DIAG, PMCH_RE_DUMP, DECIM_DUMP --
+  # all leftover from earlier, already-concluded investigations (the CFO/
+  # sync-error and race-condition bugs they were chasing are fixed; PMCH_RE_DUMP
+  # only actually dumps when PMCH_RE_DUMP_TTI also targets a specific tti, unset
+  # here). SYNC_ERR_DIAG in particular fires an unconditional fprintf on EVERY
+  # MBSFN subframe (~90% of all traffic) -- real per-subframe I/O overhead, on
+  # a pipeline already confirmed to run at ~91% of nominal throughput with the
+  # ring buffer chronically near 0% occupancy (ZMQRX_RATIO_DIAG), i.e. zero
+  # slack. Piling on more per-subframe fprintf calls than a given investigation
+  # actually needs eats into that margin and is a plausible contributor to the
+  # SYNC_OFFSET_DIAG SLOWCALL overruns/BLER collapse/crash seen during the CAS
+  # muting investigation. Keep only what THAT investigation needs live.
+  # TEMPORARY 2026-07-17: RACE_DIAG2 to chase the CAS-muting sf=0 anomaly's root
+  # cause (already fixed/masked - see SIB13_MBSFN_TEST_RESULTS.md Finding 3).
+  # Remove once that follow-up investigation concludes.
+  nsrun_root Modem  "$CONF"    "env MCH_DIAG=1 ZMQRX_RATIO_DIAG=1 SYNC_OFFSET_DIAG=1 RACE_DIAG2=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
 
   # The modem creates $TUN_DEV but leaves it DOWN with no address. Wait for it,
   # then bring it up, give it CLIENT_IFACE (the client binds its FLUTE receiver to

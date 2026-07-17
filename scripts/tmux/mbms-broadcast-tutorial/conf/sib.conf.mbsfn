@@ -219,6 +219,12 @@ sib13 =
         notification_indicator = 0;
         mcch_offset = 0;
         sf_alloc_info = 32;
+        # Restored to baseline (khz1dot25) -- 15kHz (field omitted) and
+        # 7.5kHz ("kHz7dot5") both PASSED (BLER 0.0) in the SIB13 test
+        # plan's SCS sweep. 2.5kHz needs the separate [embms]
+        # subcarrier_spacing override in enb_baseline.conf instead (not
+        # expressible via this base r9/r14 field), so this field goes back
+        # to its normal baseline value for that test.
         subcarrier_spacing = "khz1dot25";
     };
 };

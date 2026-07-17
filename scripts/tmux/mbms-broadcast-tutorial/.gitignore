@@ -7,3 +7,4 @@ soapy-zmq-bridge/
 *.crash
 conf/*.state
 tools/ul-feeder
+__pycache__/
