@@ -30,7 +30,7 @@ this rig, not just to this investigation, and were previously invisible.
 | 4 | CAS muting (k_cas,n_cas up to 32,16) | **FIXED 2026-07-17**: BLER inflation traced to a spurious equalized-power anomaly (~14% of muted sf=0 occasions) being wrongly counted as decode failures; validity gate extended, live-verified MCH BLER 0.82-1.00 → 0.0. Underlying trigger (one specific worker-pool instance, ~14% probability) still not fully root-caused, but no longer affects correctness or reported stats — Finding 3 |
 | 5 | `pmch_bandwidth` (30, 35, 40 @ n_prb=25) | Root cause found and fixed (RX/TX pmch.c divergence + internal-vs-caller PRB count mismatch); substantially improved (MCCH mostly succeeds, MTCH now attempted) but a separate timing/blocking issue still causes most MTCH decodes to fail — Finding 4 |
 | 5b | `n_prb` (6, 15, 25, 50, 75, 100) | 6, 15 crash (Finding 6); 25, 50 clean; 75 fails via a different mechanism (Finding 7), 100 not tested live (same mechanism, confirmed via code, would be worse) |
-| 6 | TI + muting interaction | Not run — blocked by Finding 1, deferred |
+| 6 | TI + muting interaction | **PASS (2026-07-18)**: run after Findings 1 and 3 were both fixed; TI(2,4) genuinely combines correctly alongside muting(8,4) and muting(16,8) — no new interaction bug (originally-planned M=8/16 values are structurally infeasible on this rig regardless of muting, see write-up) |
 | 7 (added post-campaign) | Frequency interleaving (Rel-19 `pmch-TFI-Config`, on/off flag) | PASS — signaling and functional, BLER 0.0 (added 2026-07-15 after review found it missing from the original matrix) |
 
 **Net result: 7 real, previously-undocumented issues found** (9 counting TI's three
@@ -570,13 +570,16 @@ this one is a complete absence of an *upsampling* path. Both are bridge scaling 
 SIB13/MBSFN protocol bugs. **Practical conclusion for this rig as currently built: only
 n_prb=25 (ratio=2) and n_prb=50 (ratio=1, exact native-rate match) are usable.**
 
-### Phase 6 (TI + muting interaction): not run
+### Phase 6 (TI + muting interaction): not run at this point in the campaign
 
 Blocked by Finding 1 — testing the planned interaction cases via live `SET` would just
 re-trigger the already-documented TI propagation bug rather than exercise the interaction
 itself. Skipped rather than spending live-test time on a result that wouldn't be
 informative; revisit once Finding 1 is fixed (a static-config-plus-restart variant would
 also sidestep the live-reload bug if an earlier interaction check is wanted).
+
+**Update, 2026-07-18: run once Findings 1 and 3 were both fixed — both cases PASS, no new
+interaction bug. See "Phase 6 — run 2026-07-18" further down for the full write-up.**
 
 ## Pre-existing gaps (identified during planning, not re-verified live this campaign)
 
@@ -643,9 +646,11 @@ similar-looking symptom. That original degradation's root cause remains unfound.
 **Deliberately not attempted, real feature work not a bug fix**: Finding 6 (n_prb∈{6,15}
 decimator CPU ceiling — needs a faster/polyphase decimator), the deeper PHY-level wideband
 PMCH capability uncovered while fixing Finding 4 (needs resource-grid/softbuffer changes),
-making TI actually functional under this baseline (needs a restart-only parameter change,
-`additional_non_mbsfn_subframes`, or reconsidering the `sf_alloc_end` formula), and the
-TI/MCCH §15.3.3 spec conflict (needs genuine multi-PMCH support).
+and the TI/MCCH §15.3.3 spec conflict (needs genuine multi-PMCH support). Making TI actually
+functional under this rig's *default* baseline specifically (not just via a temporary
+restart-only parameter change, `additional_non_mbsfn_subframes=2`, applied and reverted for
+testing — see Phase 6 below) is not attempted: that would mean permanently changing the
+tutorial's default config, a product decision rather than a bug fix.
 
 `rt-mbms-tx` and `soapy-zmq-bridge` were modified this pass; `rt-mbms-modem` was not (the
 remaining open findings are suspected to involve modem-side state, but this wasn't
@@ -691,3 +696,50 @@ The original plan deferred this because Finding 1 (TI) was broken. Finding 1 is 
 cases could genuinely be run for the first time. Not attempted yet: TI's working combination
 needs a restart-only parameter change from this rig's baseline, so it needs an eNB restart to
 set up, not just a live `SET`.
+
+### Phase 6 — run 2026-07-18: both interaction cases PASS
+
+Restarted the eNB with `additional_non_mbsfn_subframes=2` (the config-file, restart-only
+change Finding 1's fix needs), then live-`SET` `mch_sched_period_rf=4` + `time_interleaving_n=2`/
+`time_interleaving_m=4` — the only legal M for this rig's resulting `sf_alloc_end=36` (M∈{8,16}
+from the original plan don't divide 36, so the two cases run were TI(2,4)+muting(8,4) and
+TI(2,4)+muting(16,8), not the originally-planned M=8/16 values, which remain structurally
+infeasible under the one known-working TI recipe on this rig).
+
+Confirmed via raw `MCHDIAG` (worker-pointer-stability method, no restart of the diagnostic
+needed since the pattern is visible in the plain per-subframe log): TI combining stayed
+genuine with CAS muting active simultaneously, in both cases. Signature: one worker instance
+holds for exactly N×M=8 consecutive `mch_sf_idx` values; the first 4 in each block report
+`crc=0` (expected — not enough repetitions combined yet), the last 4 report `crc=1` (real
+combined decode success). This ~50/50 `crc=0`/`crc=1` split is *expected* TI behavior, not a
+failure rate — over a ~400-line sample: case A (muting 8,4) 193/164, case B (muting 16,8)
+181/148, both consistent with the same pattern.
+
+One transient wrinkle, self-resolving: right after enabling muting for case A, the modem
+briefly showed a burst of `MCHIDLE`-only subframes and repeated `SIB1-MBMS` reacquisition
+prints (~10-15s) before settling into the healthy pattern above — ordinary MCCH
+modification-period reacquisition after a live reconfiguration, not a persistent bug (matches
+the propagation-window behavior already documented for other live `SET`s in this campaign).
+
+Reverted all live-set values (muting off, TI off, `mch_sched_period_rf=64`) and the
+config-file `additional_non_mbsfn_subframes` back to baseline, restarted the eNB again;
+re-verified BLER 0.0 on the plain baseline afterward.
+
+**Net result**: no new TI/muting interaction bug found — both features work correctly
+together, at least for the one TI configuration this rig supports. The dashboard did show a
+few red "Fail" subframe-activity cells during this test window; checked whether that panel
+naively flags any `crc=0` as a failure without accounting for TI's expected mid-span
+non-convergence — it does not. `MbsfnFrameProcessor.cpp:569-606` already explicitly logs
+intermediate subframes within an active TI combining span as IDLE (not FAIL) per Rel-19
+§6.5.3, only emitting FAIL on the last subframe of a span that still didn't decode; the
+frontend (`modem.js:522-529`) is a dumb, correctly-fed color map. So the red cells were
+genuine decode failures, consistent with the transient reacquisition burst noted above —
+not a dashboard bug, nothing to fix here.
+
+Also observed during this window: two brief, physically-implausible CINR spikes (~80-90dB
+instantaneous, against this rig's normal ~30-46dB range) on the CINR/BLER chart, each
+coinciding with a live reconfiguration moment and a small real BLER blip. Not independently
+root-caused — most likely the CINR estimator not clamping/resetting cleanly during the same
+transient resync windows discussed above, rather than a new decode-affecting bug (BLER impact
+was minor and self-resolving in both cases). Lower priority than the confirmed issues above;
+flagged here for a future look, not chased further this pass.
