@@ -899,3 +899,62 @@ problem. Reverted cleanly to baseline afterward (33/33 crc=1). Next session shou
 here: the CE/interpolation/reference-generation pipeline was already traced clean by static
 reading this pass (see the CE-pipeline paragraph above), so the next step is runtime
 instrumentation of the decode path itself, not more static tracing.
+
+## Root cause found (2026-07-18, same day, continued): eNB TX never actually widens for pmch_bandwidth
+
+After formula-level verification against TS 36.211 §6.10.2.2.2 (MBSFN-RS mapping) and
+§6.3.5 (generic data RE mapping) confirmed the RX's reference-signal AND data RE
+placement are both spec-correct for the wideband case, a targeted LLR/pilot/raw-grid
+dump investigation (`PMCH_RE_DUMP`, already existing in the codebase, retargeted live
+via `/tmp/pmch_dump_tti`) found: 71% of LLRs were exactly zero, correlating exactly
+with post-equalization symbols collapsed to near-zero magnitude (not NaN). Dumping the
+pre-extraction raw grid directly (`sf_symbols`, before any RX-side processing) showed a
+clean, smooth, bell-shaped power envelope spanning almost exactly the ORIGINAL,
+narrower carrier's own bandwidth (~25 PRB), centred within the wider 30-PRB acquisition
+window the RX correctly retuned to - with genuine silence at the edges. **This proves
+the eNB itself never actually transmits the wider PMCH content on the air**, even
+though `pmch_bandwidth` is correctly signalled in SIB13/MCCH - a `rt-mbms-tx` (TX-side)
+bug, not an RX decode bug, this session's RX-side fixes notwithstanding.
+
+Traced the exact mechanism in `rt-mbms-tx`: the eNB's own RF sample rate
+(`srsenb/src/phy/txrx.cc:93`) and per-subframe TX buffer sample count
+(`srsenb/src/phy/lte/sf_worker.cc:159`) are both derived from the carrier's plain
+`nof_prb` only, computed ONCE at process startup (`enb.cc`/`phy.cc`/`enb_cfg_parser.cc`'s
+one-time `cell_list_lte` snapshot) and never revisited - not on a live `pmch_bandwidth`
+`SET` (`control_server.cc` -> `rrc::reconfigure_embms()`), and not even if
+`pmch_bandwidth` were set at startup instead, since nothing re-plans the main
+CAS/PBCH/PSS/SSS `ifft[]` for the wider width either. `cc_worker.cc`'s own
+`signal_buffer_tx`/`ifft_mbsfn` ARE already correctly `mbsfn_prb`-aware, but the extra
+samples they generate are silently dropped every subframe by `sf_worker.cc`'s narrower
+declared sample count before ever reaching the radio.
+
+**Two fix attempts this session, both caused a worse regression (baseline cell search
+broke entirely) and were fully reverted**:
+1. Unconditionally provisioning `cell->mbsfn_prb` for the legal maximum (40 PRB) at
+   config-parse time, plus widening `txrx.cc`/`sf_worker.cc` to match. This made
+   `cell.mbsfn_prb != cell.nof_prb` unconditionally true, which some other code path
+   (not yet identified) apparently uses as an "is MBSFN widening active" signal -
+   baseline (`pmch_bandwidth=0`) cell search broke immediately.
+2. A more careful attempt mirroring the RX's own solution: added
+   `srsran_ofdm_tx_set_prb_symbol_sz()` (a TX-side equivalent of the RX's existing
+   `srsran_ofdm_rx_set_prb_symbol_sz()`) to decouple the main CAS/PBCH `ifft[]`'s
+   `symbol_sz` from its logical `nof_prb`, keeping content centred within a wider
+   symbol - the same principle that works correctly on the RX side. Paired with
+   `enb_baseline.conf` setting `pmch_bandwidth=40` at startup (to provision the frozen
+   snapshot correctly) and the same `txrx.cc`/`sf_worker.cc` widening. This ALSO broke
+   baseline cell search (still "Could not find any cell") - the TX-side PSS/SSS/PBCH
+   generation apparently needs more than symbol_sz decoupling to stay correct within a
+   widened symbol (unlike the RX, which only needs to *read* a wider symbol correctly;
+   the TX must *generate* PSS/SSS/PBCH sequences at the exact right position within it,
+   which may need its own dedicated centring logic this attempt didn't add).
+
+Both attempts were fully reverted (`rt-mbms-tx`: `enb_cfg_parser.cc`, `txrx.cc`,
+`sf_worker.cc`, `phy_common.h`, `enb_dl.c`, `ofdm.c`/`ofdm.h` all back to git HEAD;
+`enb_baseline.conf`'s `pmch_bandwidth` back to unset) and baseline re-confirmed healthy
+(CE diagnostics clean, dispatch correct, zero cell-search/readStream errors) before
+ending this pass. **The actual TX-side fix remains open** - the root cause is now solid
+and well-evidenced (see above), and two specific approaches are now known NOT to be
+sufficient on their own, but a properly verified fix (most likely needing the TX's
+PSS/SSS/PBCH generation to be made genuinely position-aware within a widened symbol,
+not just FFT-size-aware) needs its own dedicated, carefully-tested session rather than
+another rushed attempt.
