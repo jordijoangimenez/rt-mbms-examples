@@ -280,7 +280,7 @@ here) — but Finding 2's CAS-muting-triggered instance is a separate, still-ope
 regardless (per your instruction, TI and CAS muting were kept isolated throughout this
 investigation, never combined).
 
-### Finding 3 (CAS muting BLER breakage) — still open, precisely characterized (2026-07-16)
+### Finding 3 (CAS muting BLER breakage) — FIXED 2026-07-17, precisely characterized (2026-07-16)
 
 A follow-up pass (same day) grounded this in the actual primary spec text (TS 36.211
 v19.3.0, TS 36.331 v19.0.0, read from local copies in `~/Descargas`), not just TX/RX
@@ -623,13 +623,22 @@ tested clean (PASS, no fix needed).
 live-instrumented testing; the original finding was a misdiagnosis. The `pack_mcch()`
 duplicate-computation cleanup was kept anyway as a genuine (if unrelated) hygiene fix.
 
-**Still open, needs live-instrumented diagnosis (not more static reading)**: Finding 3 (CAS
-muting BLER breakage) — investigated across every layer without a high-confidence fix; the
-same technique that resolved Findings 1 and 4 (a live warning-level log that had been
-silently filtered) is the logical next step, not yet attempted. The Finding 4 SLOWCALL/timing
-issue above is also open. Finding 2 (modem non-recovery) is likely resolved for its
-TI-triggered path now that TI can no longer enter a signaled-but-broken state, but this
-wasn't independently re-tested; its CAS-muting-triggered path remains open regardless.
+**Fixed 2026-07-17**: Finding 3 (CAS muting BLER breakage). Root-caused to a spurious
+equalized-power anomaly specific to ~14% of muted sf=0 occasions (one worker-pool instance,
+trigger not fully explained but no longer matters for correctness); the DTX/idle gate was
+extended to also treat implausibly-high post-equalization power as "nothing reliably
+decoded," matching how the near-zero case was already handled. Live-verified: MCH BLER
+0.82-1.00 → 0.0, commit `c3bbdcd`. Finding 2 (modem non-recovery) is confirmed resolved for
+its CAS-muting-triggered path too, by the same live test (no restart needed to recover once
+muting was disabled again, consistent with the earlier TI-path finding).
+
+**Still open, needs live-instrumented diagnosis (not more static reading)**: only the Finding
+4 SLOWCALL/timing issue now. A separate, unrelated investigation (2026-07-18) into a
+previously-documented "eNB/modem long-uptime degradation" bug (BLER regresses after ~1h+/6h+
+uptime, fixed only by a fresh restart) found no new TI-independent root cause after a
+structured search across five candidate mechanisms — but did catch a real, newly-introduced
+risk in an unrelated fix (see "ZMQ_PUB send buffer" note below) before it could cause a
+similar-looking symptom. That original degradation's root cause remains unfound.
 
 **Deliberately not attempted, real feature work not a bug fix**: Finding 6 (n_prb∈{6,15}
 decimator CPU ceiling — needs a faster/polyphase decimator), the deeper PHY-level wideband
@@ -641,3 +650,44 @@ TI/MCCH §15.3.3 spec conflict (needs genuine multi-PMCH support).
 `rt-mbms-tx` and `soapy-zmq-bridge` were modified this pass; `rt-mbms-modem` was not (the
 remaining open findings are suspected to involve modem-side state, but this wasn't
 confirmed).
+
+### ZMQ_PUB send buffer: bounded HWM added, then corrected (2026-07-18)
+
+While investigating Finding 4's SLOWCALL/timing issue, added an explicit `ZMQ_SNDHWM` on the
+eNB's TX socket (`rf_zmq_imp_tx.c`, both `rt-mbms-tx` and `rt-mbms-modem` copies) — ZMQ_PUB's
+default 1000-message HWM means a momentarily-lagging subscriber causes silent message drops,
+not blocking. First attempt set it to unlimited (0); a background investigation into the
+separate long-uptime degradation bug (below) flagged that since the ~91%-of-nominal
+throughput ceiling is a *persistent*, chronic deficit rather than a transient stall, an
+unlimited HWM risks roughly unbounded queue growth for as long as it's active at ratio=1
+(no decimation margin). Corrected to a large-but-bounded value (50000) instead — keeps the
+transient-stall protection without the unbounded-growth risk. Live-verified the video demo
+stayed healthy through both the original change and the correction. Committed and pushed:
+`rt-mbms-tx` `51fdc61`, `rt-mbms-modem` `5d366cf`. Does not fix the underlying throughput
+ceiling itself (still open, see Finding 4 above) — only bounds the worst case of a mitigation
+that was already a reasonable idea for the *transient*-stall case it was originally aimed at.
+
+### Investigation: eNB/modem long-uptime degradation root cause (2026-07-18) — inconclusive
+
+Separate, pre-existing bug (see the `project-modem-long-uptime-degradation` memory and
+Finding 3's write-up above, where it was hit again and correctly identified as unrelated to
+CAS muting): BLER regresses from 0.0 to ~75-79% (modem) or a catastrophic collapse + crash
+(eNB) after prolonged uptime (modem ~6h+, eNB ~1h+), fixed only by a fresh restart of both.
+Two previously-identified candidates (`pmch_ti_tx_buf` TX race, RX softbuffer poisoning) both
+require Time Interleaving active, which the actual observed incidents did not have.
+
+A structured background search (counter wraparound, unbounded containers, softbuffer/HARQ
+reuse, floating-point drift, hot-path allocation) across both codebases found no convincing
+TI-independent candidate. The only concrete finding was the ZMQ_SNDHWM=0 risk documented
+above, which postdates and cannot explain the original, already-documented incidents. Root
+cause remains genuinely open; would need live reproduction over hours with memory/per-thread
+CPU profiling captured *before* a restart, not more static code review.
+
+### Phase 6 (TI + muting interaction) — now unblocked, not yet run
+
+The original plan deferred this because Finding 1 (TI) was broken. Finding 1 is now fixed
+(functional, given `additional_non_mbsfn_subframes=2`/`mch_sched_period_rf=4`) and Finding 3
+(CAS muting) is now fixed too — so the planned TI(4,8)+muting(8,4) and TI(8,16)+muting(16,8)
+cases could genuinely be run for the first time. Not attempted yet: TI's working combination
+needs a restart-only parameter change from this rig's baseline, so it needs an eNB restart to
+set up, not just a live `SET`.
