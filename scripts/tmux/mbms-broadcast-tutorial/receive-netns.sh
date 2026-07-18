@@ -114,10 +114,24 @@ start() {
   # actually needs eats into that margin and is a plausible contributor to the
   # SYNC_OFFSET_DIAG SLOWCALL overruns/BLER collapse/crash seen during the CAS
   # muting investigation. Keep only what THAT investigation needs live.
-  # TEMPORARY 2026-07-17: RACE_DIAG2 to chase the CAS-muting sf=0 anomaly's root
-  # cause (already fixed/masked - see SIB13_MBSFN_TEST_RESULTS.md Finding 3).
-  # Remove once that follow-up investigation concludes.
-  nsrun_root Modem  "$CONF"    "env MCH_DIAG=1 ZMQRX_RATIO_DIAG=1 SYNC_OFFSET_DIAG=1 RACE_DIAG2=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
+  # RACE_DIAG2 removed 2026-07-18: that investigation (CAS-muting sf=0 anomaly,
+  # Finding 3) is fixed and live-verified, see SIB13_MBSFN_TEST_RESULTS.md.
+  # TEMPORARY 2026-07-18: SOFTBUFFER_DIAG to confirm/rule out whether the RX
+  # softbuffer-size rejection (sch.c) is firing during the wideband pmch_bandwidth
+  # MTCH decode failure (Finding 4 continuation) -- remove once that's settled.
+  # -b sets the cell-search-phase PRB assumption (cs_nof_prb = file_bw*5,
+  # main.cpp:419-420) -- it ALWAYS wins over -p/--override_nof_prb in that
+  # ternary regardless of live-SDR vs file mode (confirmed 2026-07-18; a
+  # -p flag here is silently dead code). This must produce a search rate
+  # that exactly matches enb_baseline.conf's device_args base_srate /
+  # modem_zmqtest.conf's native_srate, or the bridge's decimation ratio is
+  # non-integer and cell search fails outright ("Could not find any cell").
+  # -b 10 -> cs_nof_prb=50 -> 15.36 MHz (matches the n_prb=25/50 baseline's
+  # base_srate=15.36e6). -b 15 -> cs_nof_prb=75 -> 23.04 MHz (matches the
+  # n_prb=75 test's base_srate=23.04e6). Keep this in lockstep with
+  # enb_baseline.conf's n_prb/base_srate and modem_zmqtest.conf's
+  # native_srate whenever testing a non-default n_prb.
+  nsrun_root Modem  "$CONF"    "env MCH_DIAG=1 ZMQRX_RATIO_DIAG=1 SYNC_OFFSET_DIAG=1 SOFTBUFFER_DIAG=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
 
   # The modem creates $TUN_DEV but leaves it DOWN with no address. Wait for it,
   # then bring it up, give it CLIENT_IFACE (the client binds its FLUTE receiver to

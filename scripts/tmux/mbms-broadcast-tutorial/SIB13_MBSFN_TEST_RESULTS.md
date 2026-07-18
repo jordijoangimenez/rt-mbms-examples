@@ -29,7 +29,7 @@ this rig, not just to this investigation, and were previously invisible.
 | 3 | Time interleaving (N,M up to 16,32) | Fixed and confirmed genuinely functional (real bug: OTA switch had no case for divisor-clamped values) — works given compatible scheduling parameters; safely/honestly disables otherwise (Finding 1) |
 | 4 | CAS muting (k_cas,n_cas up to 32,16) | **FIXED 2026-07-17**: BLER inflation traced to a spurious equalized-power anomaly (~14% of muted sf=0 occasions) being wrongly counted as decode failures; validity gate extended, live-verified MCH BLER 0.82-1.00 → 0.0. Underlying trigger (one specific worker-pool instance, ~14% probability) still not fully root-caused, but no longer affects correctness or reported stats — Finding 3 |
 | 5 | `pmch_bandwidth` (30, 35, 40 @ n_prb=25) | Root cause found and fixed (RX/TX pmch.c divergence + internal-vs-caller PRB count mismatch); substantially improved (MCCH mostly succeeds, MTCH now attempted) but a separate timing/blocking issue still causes most MTCH decodes to fail — Finding 4 |
-| 5b | `n_prb` (6, 15, 25, 50, 75, 100) | 6, 15 crash (Finding 6); 25, 50 clean; 75 fails via a different mechanism (Finding 7), 100 not tested live (same mechanism, confirmed via code, would be worse) |
+| 5b | `n_prb` (6, 15, 25, 50, 75, 100) | 6, 15 crash (Finding 6, decimator CPU ceiling, unresolved); 25, 50, **75, 100 all clean (Finding 7 fixed 2026-07-18** — config-only: `base_srate`/`native_srate`/cell-search `-b` flag must all match the true rate for the configured `n_prb`, not just the bridge's own decimation ratio) |
 | 6 | TI + muting interaction | **PASS (2026-07-18)**: run after Findings 1 and 3 were both fixed; TI(2,4) genuinely combines correctly alongside muting(8,4) and muting(16,8) — no new interaction bug (originally-planned M=8/16 values are structurally infeasible on this rig regardless of muting, see write-up) |
 | 7 (added post-campaign) | Frequency interleaving (Rel-19 `pmch-TFI-Config`, on/off flag) | PASS — signaling and functional, BLER 0.0 (added 2026-07-15 after review found it missing from the original matrix) |
 
@@ -185,7 +185,7 @@ it only logs a warning on change, `Rrc.cpp:501-507`), so this wasn't the cause o
 observed test failure — but it's a real gap for any spec-compliant receiver. Fixed:
 `configure_mbsfn_sibs()` now bumps the tag the same way `regenerate_si()` does.
 
-### Finding 7 (`n_prb`∈{75,100} native-rate ceiling) — mitigated: fails loudly instead of silently
+### Finding 7 (`n_prb`∈{75,100} native-rate ceiling) — first pass: mitigated only (fails loudly instead of silently; actually fixed later, see below)
 
 Building real bidirectional dynamic resampling (the actual fix) is a substantial
 architecture change spanning both the TX and RX sides of `soapy-zmq-bridge` (confirmed: the
@@ -199,6 +199,46 @@ drift and a MIB that never decodes.
 
 **Files changed**: `soapy-zmq-bridge/ZmqRxDevice.cpp` (rebuilt, `libzmqrxSupport.so`
 redeployed).
+
+### Finding 7, actually fixed (2026-07-18): both n_prb=75 and n_prb=100 now genuinely work — config-only, no code changes
+
+The "substantial architecture change" framing above turned out to be wrong once actually
+investigated: real bidirectional resampling was never needed. The eNB's own TX rate is
+*also* just a hardcoded config literal (`enb_baseline.conf`'s `device_args=...,base_srate=
+15.36e6,...`), completely decoupled from `n_prb` — confirmed via `txrx.cc:93-99`, which
+already correctly computes the right rate for any `n_prb` via `srsran_sampling_freq_hz_scs()`
+and calls `set_tx_srate()`, but that value only sets a decimation *ratio* against the
+still-fixed `base_srate` (`rf_zmq_imp.c:437-457`) — it never changes what's actually sent
+over the wire. So the eNB has the identical bug class as the bridge, and the two combine:
+whatever `base_srate` says is genuinely what goes out, and the bridge's `native_srate` must
+match it exactly for the ratio to even be computable.
+
+**The fix**: keep `base_srate` (`enb_baseline.conf`) and `native_srate`
+(`modem_zmqtest.conf`) equal to each other and equal to the true rate for whatever `n_prb`
+is configured (25→7.68e6, 50→15.36e6, 75→23.04e6, 100→30.72e6 — the standard LTE
+bandwidth-class table). At 75/100 this makes the bridge ratio exactly 1 (plain passthrough,
+same as the already-working 50 PRB case), not 2/3/4 needing new upsampling logic.
+
+That alone wasn't sufficient — it surfaced a **second, previously-invisible bug**: the
+modem's blind cell-search phase (`Phy::cell_search()`, `main.cpp:419-420`) assumes a
+hardcoded PRB count for its own FFT/frame sizing, taken from the `-b`/`--file-bandwidth`
+CLI flag (`cs_nof_prb = file_bw * 5`) — **not** from `-p`/`--override_nof_prb` as the flag's
+name would suggest; `file_bw` unconditionally wins in that ternary regardless of live-SDR
+vs. file mode, making `-p` silently dead code for this launch script. `receive-netns.sh`
+has always passed `-b 10` (→ `cs_nof_prb=50`, matching the pre-existing 15.36 MHz baseline
+exactly, which is why n_prb=25/50 never surfaced this). At 75/100, `-b` must be bumped to
+match too (`-b 15`→`cs_nof_prb=75`→23.04 MHz; `-b 20`→`cs_nof_prb=100`→30.72 MHz), or cell
+search fails outright (`Phy: Could not find any cell in this frequency`) from a non-integer
+bridge decimation ratio during the search phase. Both mechanisms confirmed live: n_prb=75
+and n_prb=100 each reached clean BLER 0.0 once `base_srate`/`native_srate`/`-b` were all
+kept in lockstep with `n_prb`; reverted all three back to the 25-PRB baseline afterward,
+re-confirmed unchanged (243/243 CRC pass).
+
+**Files changed**: `enb_baseline.conf` (`base_srate`, transiently, back to baseline),
+`modem_zmqtest.conf` (`native_srate`, `search_sample_rate_hz`, transiently, back to
+baseline; comment added documenting the required lockstep), `receive-netns.sh` (`-b` flag,
+transiently, back to baseline `10`; comment added). No source code changes — this was
+entirely a test-harness/config gap, not a bug in the eNB/modem/bridge code itself.
 
 ### Pre-existing gap fixed: `pmch_bandwidth=25` falsely accepted as a valid value
 
@@ -570,6 +610,16 @@ this one is a complete absence of an *upsampling* path. Both are bridge scaling 
 SIB13/MBSFN protocol bugs. **Practical conclusion for this rig as currently built: only
 n_prb=25 (ratio=2) and n_prb=50 (ratio=1, exact native-rate match) are usable.**
 
+**Superseded, 2026-07-18: this "no upsampling path" framing was wrong — no upsampling was
+ever needed.** The eNB's own TX rate is *also* just a hardcoded `base_srate` literal,
+decoupled from `n_prb` the same way the bridge's `native_srate` is; nothing was ever
+actually transmitting at 23.04/30.72 MHz to upsample from in the first place. Setting
+`base_srate`/`native_srate` to the correct value for the configured `n_prb` (making the
+bridge ratio exactly 1, not >1) plus a second, previously-hidden fix to the modem's
+cell-search `-b` flag resolved both n_prb=75 and n_prb=100 completely — see "Finding 7,
+actually fixed" earlier in this document for the full writeup. **Both are now usable**,
+same as 25/50.
+
 ### Phase 6 (TI + muting interaction): not run at this point in the campaign
 
 Blocked by Finding 1 — testing the planned interaction cases via live `SET` would just
@@ -618,9 +668,10 @@ three CAS-dashboard diagnostic functions had the same PRB-sizing bug (cosmetic o
 real CAS decode path was never affected).
 
 **Also fixed and live-verified**: the `pmch_bandwidth=25` pre-existing gap, the missing
-`systemInfoValueTag` bump, `n_prb`∈{75,100} now fail loudly instead of silently misbehaving.
-Frequency interleaving was found missing from the original matrix entirely and, once added,
-tested clean (PASS, no fix needed).
+`systemInfoValueTag` bump. `n_prb`∈{75,100} initially only made to fail loudly instead of
+silently misbehaving — later (2026-07-18) actually fixed outright, config-only, see
+"Finding 7, actually fixed" further up. Frequency interleaving was found missing from the
+original matrix entirely and, once added, tested clean (PASS, no fix needed).
 
 **Corrected, not a bug**: Finding 5 (MCS=28 clamp) — could not be reproduced under
 live-instrumented testing; the original finding was a misdiagnosis. The `pack_mcch()`
