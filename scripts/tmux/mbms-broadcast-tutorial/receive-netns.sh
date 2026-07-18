@@ -131,7 +131,10 @@ start() {
   # n_prb=75 test's base_srate=23.04e6). Keep this in lockstep with
   # enb_baseline.conf's n_prb/base_srate and modem_zmqtest.conf's
   # native_srate whenever testing a non-default n_prb.
-  nsrun_root Modem  "$CONF"    "env MCH_DIAG=1 ZMQRX_RATIO_DIAG=1 SYNC_OFFSET_DIAG=1 SOFTBUFFER_DIAG=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
+  # TEMPORARY 2026-07-18: PMCH_CE_DIAG to pinpoint where the wideband-PMCH
+  # channel-estimate NaN actually originates (post-pmch_get extraction vs
+  # later equalization) - remove once that investigation concludes.
+  nsrun_root Modem  "$CONF"    "env MCH_DIAG=1 ZMQRX_RATIO_DIAG=1 SYNC_OFFSET_DIAG=1 SOFTBUFFER_DIAG=1 PMCH_CE_DIAG=1 RACE_DIAG2=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
 
   # The modem creates $TUN_DEV but leaves it DOWN with no address. Wait for it,
   # then bring it up, give it CLIENT_IFACE (the client binds its FLUTE receiver to
