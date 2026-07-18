@@ -794,3 +794,108 @@ root-caused — most likely the CINR estimator not clamping/resetting cleanly du
 transient resync windows discussed above, rather than a new decode-affecting bug (BLER impact
 was minor and self-resolving in both cases). Lower priority than the confirmed issues above;
 flagged here for a future look, not chased further this pass.
+
+## Follow-up pass, 2026-07-18: CAS stability across wideband retune, a real concurrency crash, and Finding 4 re-confirmed
+
+Picked back up on Finding 4 (`pmch_bandwidth` wideband, PMCH > carrier). Four distinct,
+independently live-verified fixes this pass, plus a re-confirmation that the one remaining
+Finding 4 symptom (MTCH decode) is the same pre-existing gap already documented above, not a
+new regression.
+
+**Fixed and confirmed — `rt-mbms-modem`, all uncommitted, pending commit:**
+
+1. **CAS instability across a wideband retune**: `Phy::set_cell()` resized `_ue_sync`'s
+   fft_size/sf_len for the new geometry but never called `srsran_ue_sync_reset()`, leaving it
+   in `SF_TRACK` applying corrections computed under the OLD geometry to samples now aligned to
+   the NEW one. Separately, the retune trigger (`main.cpp`, `phy.nof_mbsfn_prb() > cas_nof_prb`)
+   had no guard against re-firing, so it repeated on every CAS occasion (~360ms) for as long as
+   `pmch_bandwidth` stayed wider than the carrier, continuously restarting the SDR and
+   resyncing. Fixed both (sync reset + a `mbsfn_nof_prb`-tracked one-shot guard). Live-verified:
+   CAS held stable for 4+ minutes straight through PDSCH, confirmed directly by the user
+   comparing dashboard behavior before/after.
+2. **A genuine double-free/heap-corruption race**: `set_cell()` (main thread) reallocates a
+   processor's FFT/CIR buffers while a previously-dispatched, fire-and-forget `process()` call
+   may still be running on a worker-pool thread against those same buffers. First fix attempt
+   (a mutex) caused a *worse*, guaranteed deadlock (`get_rx_buffer_and_lock()` already holds the
+   same non-recursive mutex on the main thread before `pool.push()` even runs) and was reverted.
+   Real fix: capture the `std::future` `pool.push()` already returns (previously discarded) per
+   processor (`cas_future`, `mbsfn_futures[thread_cnt]` in `main.cpp`), and `.wait()` on it
+   immediately before that processor's next `set_cell()` call, at all three call sites (CAS
+   retune, MBSFN reconfigure, post-sync-loss CAS re-sync). Live-verified: no crash across
+   repeated widen/narrow retune cycles and sustained wideband operation (previously crashed
+   with `double free or corruption` within minutes).
+3. **Missing retune-back-down logic**: the retune trigger only handled PMCH growing wider than
+   the carrier; reverting `pmch_bandwidth` back to 0 left the SDR/CAS FFT permanently stuck at
+   the wider grid (wrong RE-per-symbol count) until a full process restart, even though the eNB
+   was signalling a narrower width again. Spotted live by the user via the CAS composition
+   dashboard ("changed again and this should not be different, CAS is the same"). Fixed by
+   generalizing the trigger to `target_mbsfn_prb = max(actual PMCH width, carrier)` and
+   retuning whenever that changes in *either* direction (using the plain carrier-rate calc,
+   not the MBSFN-SCS-aware one, when narrowing back to the carrier's own width). Live-verified
+   across two full widen→narrow cycles: `fft_size`/`sf_len` correctly return to the 25 PRB
+   baseline (512/7680) both times, CRC 87/87 and 100% (post-settling) respectively.
+4. **CAS composition dashboard canvas-width bug**: `CasFrameProcessor::composition_grid()`
+   sized its rendering canvas from `max(nof_prb, mbsfn_prb)` — copied from `cir_values()`/
+   `ce_values()`, which genuinely need the wider canvas since they represent the MBSFN-adjacent
+   sample stream. But composition_grid() only marks CAS-domain elements (PBCH/PSS/SSS/CRS/
+   PCFICH/PDCCH), which are semantically always the carrier's own width, never wider. Worse,
+   this was internally inconsistent: PBCH/PSS/SSS were drawn centred in the wider canvas while
+   CRS/PCFICH/PDCCH used narrow, uncentred carrier-relative indices — so elements no longer
+   lined up with each other on top of the whole chart being visually wider than it should be.
+   Fixed by using `_cell.nof_prb` alone. User-confirmed live ("CAS is peffect") immediately
+   after the fix, at the exact same `pmch_bandwidth=30` config that showed it broken before.
+
+**Re-confirmed, not fixed — same pre-existing gap as Finding 4 above, not a new regression:**
+spent substantial time this pass tracing the full CE pipele for the `pmch_bandwidth=30`
+extended-BW case end-to-end (reference-sequence generation in `refsignal_dl.c`, raw pilot
+extraction, the `chest_dl.c` LS-estimate computation, and interpolation) — all internally
+self-consistent by static reading, no new bug found. (Side note: for this specific "PMCH wider
+than carrier" scenario, `main.cpp` already forces `cell.nof_prb = max(nof_prb, mbsfn_prb)`
+before configuring the MBSFN processor, making every `act_prb`-vs-`nof_prb` distinction in
+that pipeline numerically inert here — it only matters for the opposite, sub-allocation case.)
+Symptom observed: `cepw` (channel-estimate power) stays suspiciously constant/real while
+`rxpwr`/`datapw` (actual decoded data power) collapses to noise floor and CRC is 100% fail,
+with `SYNC_OFFSET_DIAG SLOWCALL` present throughout (11-12ms per 1ms budget). This exactly
+matches the already-documented Finding 4 continuation above ("a separate, still-unexplained
+timing/blocking issue... still causes most MTCH data decodes to fail") — confirmed to be the
+same open gap, not something introduced by this pass's fixes. Still needs live timing
+instrumentation (not more static code reading) to actually crack.
+
+**Two more fixed and confirmed, found via user-spotted dashboard anomalies:**
+
+5. **MBSFN CE waterfall chart showing solid green blocks either side of the real content**:
+   both `CasFrameProcessor::ce_values()` and `MbsfnFrameProcessor::ce_values()` zero-pad their
+   wider display canvas with a raw `0.0f`/`memset`, but that padding region never goes
+   through `srsran_vec_abs_dB_cf()`'s own `-80` floor - only the real, centred active-PRB
+   content does. The dashboard's `waterfall_color()` maps `db=0` to a strong, solid green
+   (RGB≈(19,162,0) at this chart's -20..25dB scale), not black/background, so the padding
+   rendered as two solid green blocks bookending the real (narrower) content. Fixed by
+   filling the padding with `-80.0f` directly instead of `0`/`memset`, in both files.
+   (`cir_values()` in both files was already correct — it dB-converts the *entire* IFFT
+   output, no partial-region padding issue.)
+6. **A stuck-worker MCCH decode failure, found while investigating #5**: `MCCHDIAG` showed
+   100% CRC failure across the *entire* modem run (1745/1745 samples), always on the exact
+   same pinned worker-pool instance, while MTCH decode on the other instances stayed
+   perfectly healthy the whole time. Traced the real scheduling-affecting gate
+   (`MbsfnFrameProcessor.cpp:445`'s `if (pmch_dec.crc)`, feeding `Rrc.cpp`'s independent
+   ASN.1 `unpack()` validation) — confirming the campaign's live-verified `pmch_bandwidth`/MCS
+   propagation this session was never running on corrupted data, just on whichever MCCH
+   decode last succeeded before this instance got stuck. Matches a failure mode already
+   documented earlier in this campaign (a worker instance not self-recovering after a
+   retune without a modem restart). Confirmed via a fresh restart: MCCH 52/52 and MCH 134/134
+   both crc=1 immediately - a transient state issue from this pass's heavy retune testing,
+   not a new code bug.
+
+**Dispatch ruled out as the cause, narrowing Finding 4's remaining gap**: added a `DISPATCH`
+diagnostic (env `RACE_DIAG2`, `main.cpp`) logging every `pool.push()` dispatch with its
+`mb_idx`. Fresh restart, clean baseline (MCCH 62/62 crc=1), then `pmch_bandwidth=30`: all 4
+round-robin workers dispatched perfectly evenly (156/156/156/156 over the same window) - the
+earlier "stuck worker" read on a *different* restart was a real, separate transient (matches
+Finding 6 above), not this pass's steady-state behavior. But decode still failed uniformly
+across all four (619/619 MCH, the one MCCH sample too) once widened. This rules out a
+scheduling/dispatch gap and re-centers Finding 4's remaining symptom squarely on the decode
+path itself (CE/data extraction, or the exact retune-transition timing) - not a stuck-instance
+problem. Reverted cleanly to baseline afterward (33/33 crc=1). Next session should pick up
+here: the CE/interpolation/reference-generation pipeline was already traced clean by static
+reading this pass (see the CE-pipeline paragraph above), so the next step is runtime
+instrumentation of the decode path itself, not more static tracing.
