@@ -1645,3 +1645,137 @@ trace (hypothesis 3's polling resolution was three orders of magnitude too coars
 rule this out properly); comparing the exact captured sample window itself (not just
 its FFT/phase-domain summary) against a reference sync point for bump versus non-bump
 occasions.
+
+## Part A + Part B: wideband MTCH softbuffer fix and spec-compliant multi-PMCH
+## (TS 36.300 §15.3.3), 2026-07-20
+
+### Context
+
+Two items had been carried forward as "real feature work, not bug fixes" from earlier
+passes: (1) MTCH still mostly failed to decode at wideband `pmch_bandwidth` even after
+the `pmch.c` RE-mapping/stride fixes documented above, and (2) this eNB's single PMCH
+carries both MCCH and (when enabled) time-interleaved MTCH, which TS 36.300 §15.3.3 says
+shouldn't happen on the same PMCH. Design grounded in primary spec text (TS 36.300
+V19.2.0, TS 36.331 V19.3.0) plus direct re-reading of the current code before writing a
+line — both turned out more tractable than a "deep architecture rework" framing
+suggested: most multi-PMCH scheduling plumbing (MAC, PHY subframe classification, ASN.1)
+already existed as unused/dead code for `pmch_idx>0`, and the MTCH gap had a concrete,
+numerically-derived candidate rather than needing a redesign.
+
+### Part A: wideband MTCH softbuffer sizing (`rt-mbms-modem`)
+
+**Root cause**: `MbsfnFrameProcessor.cpp`'s two `srsran_softbuffer_rx_init(&_softbuffer[i],
+100)` calls size `max_cb` from the single-subframe max TBS at 100 PRB (21 CBs). But time
+interleaving inflates the code-block count: `pmch_ti_tbs.h`'s TI-scaled TBS table
+saturates at 502624 bits, giving a hard worst-case ceiling of 83 CBs — about 4x the
+existing sizing, a function of TI alone, not `mbsfn_prb`. `sch.c`'s
+`cb_segm->C > softbuffer->max_cb` check hard-rejects any decode past this limit. MCCH
+never exercises it (always TI-disabled), so the gap was invisible until MTCH + TI
+actually combine — exactly what Part B's PMCH1 needs to deliver real data, not just
+signal correctly.
+
+**Fix**: added `PMCH_MAX_CB_TI = 83` (`MbsfnFrameProcessor.h`, derived from
+`502624/(SRSRAN_TCOD_MAX_LEN_CB-24)+1`) and switched both call sites to
+`srsran_softbuffer_rx_init_guru(&_softbuffer[i], PMCH_MAX_CB_TI, SOFTBUFFER_SIZE)`. A
+fixed constant, not dynamic per-`mbsfn_prb` sizing — the saturation behavior makes 83 a
+provable worst case regardless of configured bandwidth/TI factor. Committed as `20ff7f5`
+("Size PMCH softbuffers for worst-case TI code-block count, not untuned nof_prb=100").
+
+**Verified**: no regression at the existing (non-TI) baseline; the TI+wideband MTCH
+combination this fix specifically targets was later confirmed working end-to-end as part
+of Part B's own staged verification below (PMCH1 with TI enabled decoding real data at
+BLER 0.0).
+
+**Deferred, not done this pass**: `Phy.h`'s `MAX_PRB=100` headroom increase + an explicit
+reject-with-log if `mbsfn_prb > MAX_PRB` is ever requested (this was step 3 of the
+original design) — not yet triggered by any tested config (widest so far is 40 PRB), left
+as a follow-up rather than guessed at.
+
+**Already handled, found already committed while re-checking the design's "queued
+alongside" list**: the `chest_dl.c` `get_snr()` floor guard (the CINR-spike fix) and the
+RX-side `ZMQ_RCVHWM` bound on `rf_zmq_imp_rx.c`'s SUB socket were both already applied in
+earlier commits this campaign (rt-mbms-modem `623c304`; rt-mbms-tx `b84aea0`) — no action
+needed here.
+
+### Part B: spec-compliant multi-PMCH (`rt-mbms-tx`)
+
+**Spec grounding** (TS 36.300 §15.3.3, direct quote): "MTCH and MCCH can be multiplexed
+on the same MCH (if time interleaving is not configured)." The restriction is scoped to
+*the same PMCH* — two PMCHs (one MCCH-only, never TI; one MTCH-only, TI allowed) is the
+compliant fix. `maxPMCH-PerMBSFN = 15` (TS 36.331); 2 PMCHs is trivially within range, and
+`PMCH-InfoList-r9`/`-ListExt-v1900` are already `SIZE(0..15)` dynamic arrays — no new
+ASN.1 codegen needed.
+
+**Design**: `pmch_cfg_t` (`enb_stack_base.h`) and `rrc_cfg_t::extra_pmch`
+(`rrc_config.h`) already existed from earlier work in this campaign as inert plumbing.
+This pass consumed them:
+- `reconfigure_embms()` (`rrc.cc:1070-1095`): the pre-existing TI-on-PMCH0 warning is now
+  a hard reject *specifically when `extra_pmch` is configured* — PMCH0 always carries
+  MCCH, so once a second PMCH exists to route time-interleaved content to, the conflict
+  is enforceable for real instead of only warned about. With `extra_pmch` empty, behavior
+  is unchanged (warning only, matching every prior pass).
+- `configure_mbsfn_sibs()` and `pack_mcch()` (`rrc.cc`): both rewritten to loop over
+  `nof_pmch = 1 + extra_pmch.size()` (capped at 15), resolving each PMCH's fields from
+  either the flat `cfg.pmch_*` fields (p==0, byte-identical reads to before this loop
+  existed) or `cfg.extra_pmch[p-1]` (p>=1). `pack_mcch()` splits PMCHs into the r9 list
+  and the v1900 (phase-2-feature) list per PMCH, same rule PMCH0 already used.
+- `control_server.cc`: `embms.<field>=` keeps meaning PMCH0 (existing scripts/dashboard
+  untouched); added `embms.pmch<N>.<field>=` for N>=1, plus a restart-only
+  `embms.nof_pmch=1..15` gate.
+- Session routing: PMCH1+ sessions are not yet wired to real M3AP-driven state
+  (`rrc.cc:1860-1866`) — they use the same static single-session fallback PMCH0 uses when
+  no real session exists yet. TEID-based routing via `extra_pmch[].session_teids` is a
+  distinct, not-yet-implemented follow-up, flagged explicitly in-code rather than silently
+  assumed to work.
+
+**Bug #1 — cumulative `sf_alloc_end`** (found via live test: `mch_status/1` showed
+`present:false` right after enabling `nof_pmch=2`). `sf_alloc_end` was computed
+independently per PMCH using the same "period minus overhead" formula for each, but per
+spec (and the RX-side `Phy.cpp`'s own `pmch_start = prev.sf_alloc_end+1` convention) it
+must be cumulative — PMCH1 ended up with `pmch_start > sf_alloc_end`, an empty,
+unreachable range. Fixed in both functions by computing the area's total data-subframe
+capacity once (`rrc.cc:1838-1839`) and splitting it into contiguous per-PMCH chunks
+(`rrc.cc:1914-1917` and the equivalent block in `pack_mcch()`), the last PMCH absorbing
+any remainder.
+
+**Bug #2 — TI divisor-check used the wrong (absolute, not relative) subframe count**
+(found via live test: TI set on PMCH1 decoded as `ti_n=0, ti_m=0` despite a valid
+request). The M-divisor clamp checked the raw cumulative `sf_alloc_end` instead of the
+PMCH's own relative data-subframe count (`sf_alloc_end - this_pmch_start + 1`) — for
+PMCH0 these coincide (`pmch_start` is always 1), which is why the bug was invisible until
+a genuine second PMCH existed. Fixed by computing `this_pmch_start` before advancing
+`cumulative_end`, and searching only the legal enum divisors `{32,16,8,4}` against the
+relative count (`rrc.cc:1913-1949`).
+
+**Staged live verification** (same discipline as every prior pass — decoded value before
+functional, one variable at a time):
+1. Baseline regression (`extra_pmch` empty, `nof_pmch=1`): confirmed unchanged behavior
+   from before this change.
+2. `embms.nof_pmch=2` (restart): 2-PMCH signaling confirmed correct via decoded
+   `sib_info` (2 `PMCH-InfoList` entries, correct `sf-AllocEnd`/`mch-SchedulingPeriod`
+   after Bug #1's fix).
+3. Real MTCH decode on PMCH1 confirmed for the first time this campaign: BLER 0.0,
+   `present:true`.
+4. TI enabled on PMCH1: after Bug #2's fix, confirmed genuinely combining (not just
+   coincidentally decoding every subframe independently) via `PMCH_TI_DIAG` worker-pointer
+   block-stability — clean, consistent 8-subframe blocks (56-63, 64-71, 72-79, 80-87),
+   each pinned to a single worker, transitioning cleanly between blocks. BLER 0.0.
+5. TI on PMCH0 confirmed hard-rejected: decoded signaling stayed at `0/0` despite the
+   request, and the eNB log showed the new rejection message firing
+   (`grep "requested on PMCH0" eNB.log`), while PMCH1's own TI setting remained correctly
+   unaffected by PMCH0's rejection.
+
+### Status
+
+Both parts implemented and live-verified. rt-mbms-modem's Part A changes were committed
+earlier this pass (`3c9306f`, `20ff7f5`). rt-mbms-tx's Part B changes (`rrc.cc`, `rrc.h`,
+`rrc_config.h`, `control_server.cc`) are committed alongside this write-up. The TI-test
+config change (`enb_baseline.conf`: `time_interleaving_n=2`,
+`additional_non_mbsfn_subframes=2`) used to drive verification step 4 above has been
+reverted to true baseline (`0` / commented out) now that the test is documented — same
+pattern as every prior pass's test-only config changes.
+
+**Not done, left as explicit follow-ups**: Part A's `MAX_PRB` headroom (above); PMCH1+
+session-to-TEID routing (above); a genuine interaction test of Part B's multi-PMCH TI
+against Phase 6's CAS-muting fix (both individually verified, never combined with each
+other).
