@@ -2278,3 +2278,112 @@ is explained (idle-gate, not a bug) and the MCCH/MCH0 EVM gap is explained (the
 already-documented, already-partially-fixed ripple, not a new problem). Only the
 EVM ripple's residual cause remains genuinely open, unchanged from earlier - no new
 work landed on it this pass.
+
+## Same day, continued further: a real content source built and wired up, a second
+## stacked bug found and fixed, and the EVM ripple's CPU hypothesis properly closed
+
+### A genuine content source for PMCH1, without needing xMB/FLUTE
+
+To actually test PMCH1's data path end-to-end (not just idle/scheduling-info
+traffic), researched how BM-SC actually gets bytes into a broadcast session.
+Confirmed: BM-SC never listens on a content session's own `mcast_addr:port` - that
+address is purely the *downstream* destination baked into the packet header
+(`~/rt-mbms-bmsc/bmsc/main.cc`'s own comment: "content itself is broadcast by a
+separate FLUTE sender, not srsbmsc"). MBMS-GW's `[sgi_mb_tunnel]` listener
+(`bind_port=47000`, matching `bmsc.conf`'s own `tunnel_port`) dispatches purely on
+the encapsulated packet's destination IP via `get_c_teid_by_dist_addr()`, with only
+`N_bytes>=20` and IP version==4 checked - no real validation.
+
+Built `tools/content_push.py`: constructs a real, correctly-checksummed IPv4+UDP
+packet (byte-for-byte matching `~/rt-mbms-bmsc/bmsc/xmb/raw_udp_relay.cc`'s own
+`build_ip_udp_packet()`) and sends it as a plain UDP payload to 127.0.0.1:47000 - no
+root, no raw sockets, no FLUTE build needed. Verified the path works end-to-end at
+the network level immediately: MBMS-GW logged forwarding it under PMCH1's TEID
+(`0xcccc`), and the eNB logged receiving it over M1-U.
+
+### Second bug found: `update_bsr_mch()` silently defaulted to mch_idx=0
+
+Despite the network path working, real content injected for 45-60+ continuous
+seconds still never reached the modem (`TI_DIAG_MACSDU`/`TI_DIAG_GWMCH`: zero
+`mch_idx=1` entries throughout). Added two new diagnostics (`MCH_BSR_DIAG` at
+`mac::rlc_buffer_state()`, and a print inside `build_mch_sched()`) rather than keep
+guessing from static code reading - they showed `BUILD_MCH_SCHED pmch_idx=1`
+consistently computing `total_bytes_to_tx=0`, meaning PMCH1's session's
+`lcid_buffer_size` was still never updating, even though the SDU write itself
+(traced through GTPU -> PDCP -> RLC) was confirmed correct by code inspection.
+
+Root cause: `rlc_um_lte_tx::get_buffer_state()` invokes `bsr_callback` as a **side
+effect of being called at all** (not on write) - and the only thing that ever calls
+a PMCH's `get_buffer_state()` is `update_bsr_mch()`, via
+`get_total_mch_buffer_state()`. `update_bsr_mch()` took only a bare `lcid` (no
+`mch_idx`), so it always queried `get_total_mch_buffer_state(lcid)` with `mch_idx`
+defaulting to 0 - regardless of which PMCH's session `write_sdu_mch()`/
+`read_pdu_mch()` had actually just touched. Invisible for PMCH0 (0 == 0, the
+default was accidentally correct), but meant every *other* PMCH's entity never had
+its `get_buffer_state()` called at all - so its `bsr_callback`, and by extension
+the previous section's now-correctly-mch_idx-composing fix, never fired in the
+first place. Two separate bugs stacked in the same path: the earlier fix corrected
+*what mch_idx a report claims to be for*; this one corrects *whether the report is
+ever triggered* for a non-zero mch_idx at all.
+
+Fixed by threading `mch_idx` through `update_bsr_mch()` from both its callers.
+Committed as `6293da6`.
+
+### Live-verified: real content now reaches and decodes on PMCH1
+
+Re-injected content after the fix. `MCH_BSR_DIAG` immediately showed real, non-zero
+`tx_queue` values for `mch_idx=1` (up to 2167 bytes) and `BUILD_MCH_SCHED` computed
+a genuine non-zero `mtch_stop` (real transmission windows, not just the idle
+scheduling-info-only case). On the RX side: `TI_DIAG_MACSDU`/`TI_DIAG_GWMCH` both
+showed substantial `mch_idx=1` activity for the first time ever (194/225 samples
+respectively in one check), with the decoded hex payload directly showing the
+injected marker text (`636f6e74656e745f70757368` = ASCII "content_push"). `MCH 1`
+stayed at `BLER 0.0`, `MCS 9` throughout - genuine content, genuinely decoding
+cleanly.
+
+### MTCH SLOWCALL timing issue: did not reproduce with real content flowing
+
+The previously-untestable-without-content SLOWCALL issue was checked during the
+real-content test window: zero `SLOWCALL` entries. Doesn't confirm it's fixed or
+gone (this test's payload size/rate may not reach whatever threshold originally
+triggered it, and the original occurrences were at a different, wider
+`pmch_bandwidth` configuration) - but it's a clean, real data point: ordinary real
+content at this session's current config does not trigger it.
+
+### EVM ripple, CPU-frequency/migration hypothesis: properly closed this time, still
+### negative
+
+Let the modem run with `CPU_MIGRATION_DIAG` (per-occasion, inline core+frequency
+sampling, added this pass) through the whole content-injection testing above,
+accumulating 2776 clean samples (one extreme outlier, evm=141.77 at a migration
+event, excluded - matches the already-documented "degenerate equalizer
+denominator" artifact pattern from the DTX-detection gate elsewhere in this file,
+a known rare glitch unrelated to the steady ripple).
+
+Result: **no meaningful correlation.** Migration rate in bump samples (56.8%) is
+statistically indistinguishable from normal samples (55.3%); mean core frequency in
+bumps (3.26 MHz) is nearly identical to normal (3.36 MHz); even the weakest
+signal checked (rate of running on a sub-1GHz core) only differs modestly (18.9%
+bump vs 14.8% normal - not a strong effect). An earlier same-day check on a much
+smaller sample (n=347, only 3 bumps) suggested a real gap; that turned out to be
+noise from too few bump samples, not a real effect - a good reminder to distrust
+small-n correlations even when they look clean.
+
+This properly closes the loop the original 2026-07-20 investigation left open
+("hypothesis 3... ruled out at this granularity... would need sub-millisecond
+resolution"): now tested at genuine sub-ms, per-occasion resolution, and it's a
+clean negative. The residual EVM ripple's cause remains genuinely unexplained -
+both real candidates found this campaign (thread scheduling priority: confirmed
+real, partial; CPU frequency/migration: now confirmed not a factor) have been
+tested. No further concrete hypothesis is queued.
+
+### Status
+
+All three items from "what's next" (residual EVM ripple, MTCH SLOWCALL, real PMCH1
+content delivery) were picked up this pass. Two produced real, fixed, live-verified
+outcomes (PMCH1 content delivery - a genuine second bug, now fixed; SLOWCALL - a
+clean non-reproduction data point). One produced a clean, methodologically solid
+negative result (EVM ripple's CPU hypothesis) rather than a fix - itself valuable,
+since it retires a candidate the earlier coarse test could only call
+"inconclusive." Nothing left mid-air: every thread ended in either a confirmed fix
+or a confirmed non-finding, not an open question.
