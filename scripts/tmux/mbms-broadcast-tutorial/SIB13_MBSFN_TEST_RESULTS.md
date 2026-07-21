@@ -1964,3 +1964,171 @@ test session.
 session (noted above, likely a narrow pre-existing client-side gap); the `nc`
 batched-SET reliability issue (operational note above, workaround known, root cause in
 `nc`'s own pipelining vs. the control socket's line protocol not isolated).
+
+## Continuation pass, 2026-07-21: the `dest`-field gap is deeper than assumed above —
+## real data loss, not a display gap; `nc` fix confirmed closed; two stale diagnostic
+## leftovers found and cleared as EVM-ripple/MTCH-timing confounds
+
+### `nc` batched-SET: confirmed already closed
+No new work needed — `control_server.cc`'s `handle_connection()` rewrite (commit
+`dc362af`, earlier this pass) already processes every line in a connection's buffer,
+not just the first. Re-checked `git log`/`git status` on this file: committed, clean,
+no follow-up required.
+
+### The PMCH1 `dest`-field gap is NOT "likely a narrow client-side display gap" —
+### it's real MTCH content never reaching `Gw::write_pdu_mch()` at all
+
+Picked back up with `PMCH_TI_DIAG` (already live from the previous pass). Findings,
+in order:
+- `TI_DIAG_ADDBEARER`: both PMCH0 and PMCH1 show `has_bearer=1` for their respective
+  sessions — bearer registration itself is correct on the RX side.
+- `TI_DIAG_GWMCH` (`Gw::write_pdu_mch()`, `Gw.cpp`): only `mch=0` entries over a 20+
+  second observation window (26 of them) — **zero** `mch=1` entries. `Gw` is simply
+  never called with `mch_idx=1`, for either MCCH or (if it ever reaches this point)
+  MTCH content.
+- `TI_DIAG_MACSDU` (`MbsfnFrameProcessor.cpp`, immediately before the
+  `_rlc.write_pdu_mch()` call): 105 entries, all `lcid=1`, but this diagnostic did not
+  print `mch_idx` — so it cannot distinguish PMCH0 SACH traffic from PMCH1 content
+  traffic. Both sessions plausibly use `lcid=1` (MRB LCIDs are local to their own PMCH
+  per 36.331), so "all lcid=1" is not informative on its own.
+
+**Fix applied, not yet live-tested**: added `mch_idx=%u` to the `TI_DIAG_MACSDU` print
+(`MbsfnFrameProcessor.cpp`, the call site right before `_rlc.write_pdu_mch()`).
+Rebuilt the modem successfully against this change. **Testing this requires a modem
+restart, which this pass could not get approval for** (see "Blocked" below) — so
+whether MAC SDU writes are even being attempted for `mch_idx=1` at all (vs. failing
+somewhere between there and `Gw`) is still an open question, not yet answered.
+
+### Two stale, uncommitted diagnostic/config leftovers found and cleared — both look
+### like real confounds for open investigations, not just hygiene
+
+While reviewing `git status`/`git diff` across all repos before making further changes
+(standard practice this campaign — confirm no forgotten state before trusting a test),
+found two items that had been sitting active/uncommitted for 1-2 days without being
+revisited:
+
+1. **`modem_zmqtest.conf`: `main_thread_priority_rt` was still `0`**, a "TEMP
+   diagnostic 2026-07-19: testing if RT priority is the SIGKILL trigger" flag tied to
+   the now-abandoned shared-widened-FFT architecture (superseded by the resampler-
+   bridge redesign, confirmed already implemented and working — `enb_dl.c`/`ue_dl.c`
+   both have `cas_buffer`/`cas_upsampler`/`cas_decimator` in place, `pdcch_status`
+   100%, BLER 0.0 per the 2026-07-19 write-up above). The doc itself already flagged
+   this as "still pending: revert `main_thread_priority_rt` to 20... long-standing,
+   unrelated temporary SIGKILL workaround, still not investigated" as of 2026-07-19,
+   and it was never revisited across either the 2026-07-20 or 2026-07-21 passes —
+   including the **entire MCCH EVM ripple investigation**, which ran this whole time
+   with the modem's main thread (the one that calls `phy.get_next_frame()` —
+   `main.cpp`'s sample-sync/frame-timing call, feeding every subsequent decode) at
+   **non-realtime scheduling priority** on a shared, busy 32-core machine. The EVM
+   ripple write-up's hypothesis 3 tested CPU *frequency* governor variance and found
+   it inconclusive; it never tested thread *scheduling priority*/preemption, which is
+   a related but distinct mechanism — a non-RT main thread can be delayed by any other
+   runnable process on its core even at full frequency. This is a plausible, previously
+   untested candidate mechanism for "genuine intermittent per-occasion channel-estimate
+   degradation, no fixed period" — matching the ripple's own description closely.
+   **Reverted to `20`** (the documented, intended default). Not yet live-tested — same
+   restart blocker as above. Treat as a new, unconfirmed hypothesis 6 for the EVM
+   ripple investigation, not a confirmed fix.
+2. **`receive-netns.sh`: `PMCH_RE_DUMP=1` was still in the modem's launch line**,
+   despite this same file's own comment block saying it was "removed 2026-07-19" for
+   being actively harmful. Checked `pmch.c` directly: its RX FAIL-DUMP site
+   (`pmch.c:1078`) does a real `fopen`/`fwrite`/`fclose` of the failed LLR buffer on
+   *every* CRC failure, unconditionally — it does not go through the
+   `pmch_re_dump_enabled()`/`PMCH_RE_DUMP_TTI` tti-filter that gates this file's other,
+   properly-bounded dump sites. Given MTCH decode still mostly fails at the current
+   wideband config (the still-open "SLOWCALL timing issue" from the previous
+   sequencing note), this was firing on most subframes — the exact per-subframe-disk-
+   I/O pattern already root-caused as a `SYNC_OFFSET_DIAG SLOWCALL` contributor when
+   first found on 2026-07-19. It was evidently re-enabled at some point after that
+   removal (the code comment at the dump site itself mentions reuse "for the 2026-07
+   CAS-muting sf=0 investigation") without the receive-netns.sh comment being updated
+   to match. **Removed from the launch line.** Not needed for the PMCH1 investigation
+   above (that uses `PMCH_TI_DIAG`'s own gate, unaffected). May also be relevant to,
+   though not yet confirmed as the cause of, the open MTCH SLOWCALL timing item.
+
+### Blocked: modem restart needed to test all three of the above, not approved this
+### pass
+
+Stopping/restarting the modem (via `receive-netns.sh`, which tears down and recreates
+its network namespace) was not approved in this pass — per this campaign's standing
+practice, live real-time DSP process restarts get a live confirmation rather than
+proceeding unattended. All three changes above (`mch_idx` diagnostic, RT-priority
+revert, `PMCH_RE_DUMP` removal) are in place and ready, but **none are live-verified
+yet**. Next steps once a restart is approved, in order:
+1. Restart modem (`sudo ./receive-netns.sh stop && sudo ./receive-netns.sh start`),
+   confirm baseline still passes (`pdcch_status`, BLER) before trusting anything else.
+2. Check `TI_DIAG_MACSDU`'s new `mch_idx` field: does `mch_idx=1` ever appear at all?
+   If not, the gap is upstream of this print (worth checking whether PMCH1's
+   CRC-success branch is even reached); if yes, but still no matching `mch=1` in
+   `TI_DIAG_GWMCH`, the gap is between this print and `Gw::write_pdu_mch()` (RLC/PDCP
+   layer — `rlc::write_pdu_mch()`'s `valid_lcid_mrb()` check, or `pdcp::write_pdu_mch()`'s
+   `lcid==0` branch, are the two candidate points already identified as worth checking).
+3. Re-run the EVM ripple observation with `main_thread_priority_rt=20` restored;
+   compare bump frequency/magnitude against the 2026-07-20 baseline numbers
+   (~4.66% steady, 4.7-16.3% bumps) to confirm or rule out hypothesis 6.
+4. Re-check whether the MTCH SLOWCALL timing issue improves now that `PMCH_RE_DUMP`'s
+   per-failure disk I/O is out of the decode path.
+
+### Resolved: modem restarted, all three changes confirmed live — and the PMCH1
+### `dest`-field/GW-delivery question has a definitive answer: not a bug
+
+Modem restarted (fresh PID, `main_thread_priority_rt=20` confirmed via the startup log
+line "Raising main thread to realtime scheduling priority 20"; `PMCH_RE_DUMP` confirmed
+absent, zero matches in the fresh log; `mch_idx`-augmented `TI_DIAG_MACSDU` live).
+eNB/MBMS-GW/BM-SC were **not** restarted this time (out of scope of what was approved) —
+still the same ~6h+ instances from earlier in the day, so anything timing-sensitive
+observed against them carries that caveat.
+
+**PMCH1 GW-delivery gap: root cause found. Not a bug.** With `mch_idx` now in the
+`TI_DIAG_MACSDU` print, the picture is unambiguous: **zero** `mch_idx=1` entries (42/42
+were `mch_idx=0`), and correspondingly zero `TI_DIAG_GWMCH mch=1` entries (28/28 were
+`mch=0`) — while `TI_DIAG_ADDBEARER` still confirms both PMCHs have `has_bearer=1`.
+Cross-checked against `TI_DIAG_SUBH` (one level up the call chain, logs every MAC
+subheader regardless of type): 48 entries show `is_mcch=0 is_sdu=1 ce_type=0 lcid=0` —
+an SDU-flagged subheader with `lcid=0` on a *non*-MCCH subframe. `lcid=0` is reserved
+for MCCH (TS 36.321 Table 6.2.1-4); a real MTCH data subframe should never legitimately
+carry it. This is exactly the pre-existing, already-documented "all-zero placeholder
+TB" pattern (`MbsfnFrameProcessor.cpp`'s own comment, ~line 649-658): when a PMCH's
+session has nothing real queued, the eNB still transmits a well-formed but empty TB
+(needed to maintain synchronization/channel estimation), which decodes successfully
+(hence CRC/BLER counts it as a clean subframe) but whose first MAC subheader byte reads
+as `lcid=0` — correctly recognized and silently dropped (`spdlog::debug("Dropping
+spurious MCCH-LCID SDU...")`, `continue;`) rather than misdelivered.
+
+Confirmed independently: no content-generating process exists anywhere on this host
+(`ps aux` shows no flute/ffmpeg/udpsend/content-generator of any kind), and
+`BM-SC.log` contains exactly 8 lines total, ending at session announcement ("Content
+session announced (TMGI 901:56:000010, 239.255.1.1:6000, TSI 2)") with **no**
+forwarding/byte/packet activity ever logged. The BM-SC's xMB path only relays bytes
+when something actually pulls/pushes content through it (confirmed working
+end-to-end for HLS in an earlier, separate campaign — see
+`project-xmb-bmsc-hls-test` context); this test session was only ever given a
+signaling-only setup (`urn:3gpp:test-content-service`, a placeholder URI), never a
+real content source.
+
+**Conclusion**: the session-to-PMCH1 signaling, scheduling, and bearer-registration
+path (this pass's Findings 1-4, all still valid and correctly fixed) is completely
+sound end-to-end. "PMCH1's dest field stays empty" and "no real GW delivery for
+mch_idx=1" were never a display gap or a pipeline bug — they are the **correct**
+observable outcome of testing a session with real control-plane signaling but no
+data-plane content behind it. `BLER=0.0` was true and meaningful (no genuine decode
+failures), but it does not by itself prove content delivery, since it counts clean
+*subframes*, not delivered *SDUs* — a distinction this investigation conflated until
+now. Closing this out: no code fix needed. A genuine end-to-end content-delivery test
+would need a real traffic source (e.g. an actual xMB Pull ingest, or even a simple
+continuous UDP sender) feeding the test session's multicast address — flagged as a
+possible future test, not attempted this pass (new test-infrastructure work, not a
+bug fix, and out of scope of what was asked for here).
+
+**EVM ripple (hypothesis 6): informal spot-check only, inconclusive.** 30 consecutive
+`MCCHDIAG` samples in the few minutes since restart: 24/30 at a stable 0.0525 (5.25%,
+close to the previously-documented ~4.66% baseline), but bumps still present
+(0.0652, 0.0606, 0.0549 — smaller than the previously-observed max of 16.3%, but this
+is a far smaller sample than the original investigation used, not a controlled
+comparison). **This does not confirm or rule out hypothesis 6** — the RT-priority fix
+is live and correct as a matter of hygiene regardless, but bumps clearly still occur
+at least occasionally with it in place. A real verdict needs a longer, comparable-
+duration observation window against the original 2026-07-20 numbers, not yet done.
+
+**MTCH SLOWCALL timing item**: not re-checked this pass (would need a live wideband
+MTCH failure case to re-trigger and observe; not attempted).
