@@ -2182,3 +2182,99 @@ prerequisite as a real PMCH1 delivery test. eNB/MBMS-GW/BM-SC restart (needed to
 clear their own ~6h+ uptime and get a fully clean baseline) could not be performed
 this pass - blocked by the same restart-approval gate as the modem, needs to be run
 directly by a human operator.
+
+## Same day, continued: a fresh full-stack restart surfaced a real, previously-latent
+## bug - cross-PMCH buffer-state contamination - found, fixed, and live-verified
+
+### Context
+
+After the full `transmit.sh` + modem restart above (run by the user directly once
+the sudo/TTY-gated automated attempts kept failing), PMCH1 - previously confirmed
+CRC-succeeding on idle content - came up at **~92% BLER** (61/66 samples failing),
+stable from the very first sample, visible live on the dashboard as a red block in
+the Subframe Activity waterfall. MCCH, PDSCH, and MCH0 (SACH) all stayed clean
+(BLER 0.0) throughout - this was specific to PMCH1.
+
+### Root cause: `mac::rlc_buffer_state()` (srsenb/src/stack/mac/mac.cc) had no way to
+### tell which PMCH a buffer-state report belonged to
+
+Every PMCH numbers its own MRB sessions starting at lcid 1 (confirmed via
+`TI_DIAG_ADDBEARER`: both PMCH0 and PMCH1 have a `session[0] lcid=1`). The RLC
+bearer's own notification path (`rlc_um_lte`'s tx side, `lib/src/rlc/rlc_um_lte.cc:103`)
+calls `bsr_callback(parent->get_lcid(), n_bytes, 0)` **directly**, with only the bare
+lcid - no PMCH identity attached, since `srsran::rlc::add_bearer_mrb()`
+(`lib/src/rlc/rlc.cc:495`) handed every MRB entity, regardless of which PMCH it
+belonged to, the exact same raw `bsr_callback`. `mac::rlc_buffer_state()`'s receiving
+end compensated with a loop over all 15 possible PMCH slots, updating *every* PMCH
+whose session happened to share that bare lcid number - meaning PMCH0's real queue-
+depth reports were also being applied to PMCH1's otherwise-empty session. This
+periodically fed PMCH1's `build_mch_sched()` a false non-zero `mtch_stop`, causing
+the eNB to schedule and attempt a real transmission against a bearer that genuinely
+had nothing queued - the resulting mismatch between schedule and actual buffer
+content mostly failed CRC on the RX side.
+
+Two other candidate mechanisms were checked and ruled out before landing on this:
+the already-documented "wideband MTCH SLOWCALL" timing issue (zero `SLOWCALL`
+entries in the log, so not that) and a possible TX-side MCS/TBS misconfiguration
+specific to a cold start (eNB log showed no clamp/infeasibility warnings at all).
+
+Separately found and confirmed dead/vestigial while investigating (not the active
+bug, left alone): `rlc::update_bsr()`/`update_bsr_mch()` (`lib/src/rlc/rlc.cc`)
+compute a buffer-state value and then never actually invoke `bsr_callback` with it -
+the real notification path is the concrete entity's own direct call, described
+above. Not touched this pass; flagged here in case a future pass wants to clean it
+up, since it's currently misleading dead code, not a functional bug in its own right.
+
+### Fix
+
+- `lib/src/rlc/rlc.cc` (`add_bearer_mrb`): wrap the callback handed to each MRB
+  entity in a closure that composes `mch_idx` into the reported lcid
+  (`mch_idx * 16 + lcid` - this library file is `srsran`-namespaced and can't
+  include `srsenb`'s `compose_mch_lcid`/`PMCH_LCID_STRIDE` without an inverted
+  layering dependency, so the stride is duplicated here and must stay in sync).
+- `srsenb/src/stack/mac/mac.cc` (`rlc_buffer_state`): decompose the incoming lcid
+  and update only the PMCH it actually belongs to, instead of looping over all 15.
+
+Committed as `5bab564`. Rebuilt cleanly.
+
+### Live-verified
+
+Full stack restarted again by the user. MCH1: **14/14 samples at BLER 0.0**,
+matching MCH0 exactly. Confirmed via `TI_DIAG_ADDBEARER`/`TI_DIAG_GWMCH` that bearer
+registration was already correct throughout (never the problem) and via the eNB log
+(`M1-U TEID demux configured for 2 session(s) across 2 PMCH(s)`, both session-start
+requests received) that session setup itself was also never the problem - this was
+purely the buffer-state notification path.
+
+### Follow-up: dashboard showing MCH1 at MCS0/EVM0.00 - not a bug, explained
+
+After the fix, the user asked why the dashboard showed wildly different EVM values
+across channels (MCCH 6.22%, MCH0 4.40%, MCH1 0.00% at MCS0). Investigated by adding
+`evm` to the existing `MCHDIAG` diagnostic (`MbsfnFrameProcessor.cpp`, gated by the
+already-enabled `MCH_DIAG`) - its own comment claimed `pmch_dec.evm` was permanently
+dead/zero for regular MCH (written before `srsran_evm_run_s()` was added to
+`pmch.c`), worth checking rather than trusting. Result: zero `MCHDIAG` entries for
+`pmch_idx=1` at all (51/51 were `pmch_idx=0`) - not because the diagnostic or the fix
+are broken, but because PMCH1's subframes overwhelmingly hit an existing, unrelated
+DTX/idle-detection gate a few lines above `MCHDIAG` (`data_pw < 1e-2f`) that
+correctly recognizes "nothing real was transmitted" and explicitly skips all
+decode-accounting before ever reaching it. Since PMCH1 still has no real content
+source (unchanged from earlier this pass), its dashboard MCS/EVM fields are simply
+sitting at their never-updated default - consistent with, not contradicting, the
+fix (BLER is correctly 0.0 because the rare scheduling-info-only decodes that DO
+happen now succeed; the rest of the time there's genuinely nothing to measure).
+
+MCCH's 6.22% and MCH0's 4.40% are both real measurements, and both fall inside the
+range already characterized by the still-only-partially-fixed EVM ripple earlier
+this pass (baseline ~4.66%, bumps now reaching ~8% rather than the previous 16.3%) -
+not a new or separate issue, just two snapshots of the same still-open residual.
+
+### Status
+
+Every item raised this pass is now closed or clearly explained: the PMCH1 CRC-failure
+regression was root-caused and fixed (a real, previously-latent bug, not a cold-start
+fluke), live-verified at BLER 0.0 matching MCH0. The MCS0/EVM0.00 dashboard reading
+is explained (idle-gate, not a bug) and the MCCH/MCH0 EVM gap is explained (the
+already-documented, already-partially-fixed ripple, not a new problem). Only the
+EVM ripple's residual cause remains genuinely open, unchanged from earlier - no new
+work landed on it this pass.
