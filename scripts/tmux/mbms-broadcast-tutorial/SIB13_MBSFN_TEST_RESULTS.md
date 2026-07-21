@@ -1779,3 +1779,188 @@ pattern as every prior pass's test-only config changes.
 session-to-TEID routing (above); a genuine interaction test of Part B's multi-PMCH TI
 against Phase 6's CAS-muting fix (both individually verified, never combined with each
 other).
+
+## Closing every follow-up above: real session-to-PMCH1 delivery, three live-found bugs,
+## and the TI+CAS-muting interaction test, 2026-07-21
+
+### Context
+
+Every item the previous section left open. Spec-compliance question raised mid-pass
+(is the eps-BearerID validation this uncovered actually a spec limit, or an
+implementation artifact?) — checked directly against TS 36.331/24.116 rather than
+assumed; see Finding 2 below for what that turned up.
+
+### Finding 1: `resolve_pmch_sessions()`'s empty-vs-nothing-to-fabricate conflation broke
+### the very first M1-U packets after every startup
+
+`configure_mbms_bearers()` (new this pass — see below) called `resolve_pmch_sessions()`
+and, on an empty result, simply skipped registering a bearer at all. But
+`resolve_pmch_sessions()` returns empty for two genuinely different reasons: "PMCH1+,
+no `session_teids` filter configured" (nothing to add, correct to skip) and "no real
+M3AP session exists yet" (true of *every* PMCH for the first several seconds after eNB
+startup, until the first `MBMS Session Start Request` arrives) — the latter is exactly
+when `configure_mbsfn_sibs()`/`pack_mcch()` fabricate a placeholder session so MCCH
+keeps signalling *something*, and this loop needs to register a matching bearer for
+that placeholder too.
+
+Caught live, immediately: a fresh eNB start logged `"Can't deliver SDU for EPS bearer
+1. Dropping it."` on every single M1-U packet, persisting well past the startup window
+— all MBMS data was being silently dropped from the very first frame. Root-caused,
+fixed by giving the bearer-setup loop (extracted into its own `configure_mbms_bearers()`
+so it's callable more than once — see Finding 3) the same fabricated-fallback logic
+`configure_mbsfn_sibs()` already had. Re-verified live: bearer registers correctly at
+startup, M1-U delivery resumes, MCCH/MCH0 decode at BLER 0.0 end to end. Commit
+`a1b76b5` (rt-mbms-tx).
+
+### Finding 2: a regular-DRB bearer-id check was silently rejecting spec-legal MBMS
+### bearer ids above 10 — checked against the actual spec text, not assumed
+
+Extending the composite-key scheme (`compose_mch_lcid()`, needed so PDCP/GTP-U/
+`bearer_manager` — which have no native PMCH concept — can address MBMS bearers with a
+single flat, always-unique id) to a real second PMCH hit `gtpu_tunnel_manager::
+add_tunnel()`/`find_rnti_bearer_tunnels()` rejecting composite id 17 with `"invalid
+eps-BearerID=17"`. First fix attempt shrank `PMCH_LCID_STRIDE` to fit inside that
+0..10 ceiling — wrong: that ceiling (`is_lte_rb()`, `MAX_LTE_LCID=10`) turned out to be
+the *regular unicast DRB* `logicalChannelIdentity` range (TS 36.331 clause 6.3.2,
+`INTEGER(3..10)`), applied to the broadcast RNTI's bearers regardless of RNTI — an
+implementation bug, not a spec limit on MBMS. Confirmed directly against the spec text
+before re-fixing: MBMS's own `logicalChannelIdentity-r9` (clause 6.3.7,
+`MBMS-SessionInfo-r9`) is a distinct field, `INTEGER(0..maxSessionPerPMCH-1)` = 0..28
+(`maxSessionPerPMCH=29`, clause 6.4) — and in any case the composite id reaching this
+check was never a real ASN.1 field to begin with, so neither range is actually the
+right bound for it; the only real ceiling is `bearer_manager::add_eps_bearer()`'s own
+`uint8_t` parameter (0..255).
+
+Corrected fix: `is_valid_eps_bearer_id()` (gtpu.cc) exempts the broadcast RNTI to the
+real 0..255 range instead of loosening `is_lte_rb()` itself (which stays correct for
+actual regular-DRB bearers). `PMCH_LCID_STRIDE` restored to 16 (supports the full
+`maxPMCH-PerMBSFN=15` PMCHs at up to 15 sessions each, `14*16+15=239<255`). Live
+re-verified: PMCH1's bearer registers correctly across RLC/PDCP/`bearer_manager`/GTP-U's
+own tunnel manager, both PMCHs decode at BLER 0.0. Commit `8d9892b` (rt-mbms-tx).
+
+### Finding 3: `rrc_cfg_t::session_teids` (PMCH0's own TEID filter) was never copied
+### from static config at startup — only ever set via the live-SET path
+
+Threaded through `reconfigure_embms()` when this campaign first added TEID-based
+session routing, but never given the matching `enb_cfg_parser.cc` startup-time copy
+every other flat `embms.*` field already has. At process start it was therefore always
+empty, so `resolve_pmch_sessions()` fell back to "no filter configured, dump every real
+session onto PMCH0" — including sessions meant for PMCH1. Caught live while verifying
+Finding 4 below: a real content session configured for PMCH1 showed up duplicated on
+*both* PMCH0 and PMCH1's MCCH-signalled session lists (confirmed via `sib_info`, not
+just `mch_info` — this was genuine eNB-side signalling, not a modem/dashboard display
+artifact). Fixed with the one missing line (`rrc_cfg_->session_teids =
+args_->stack.embms.session_teids;`); re-verified live: PMCH0 lists only the SACH,
+PMCH1 lists only the content session, both decode at BLER 0.0. Commit `bfba93d`
+(rt-mbms-tx, bundled with Finding 4's static-config work since both surfaced in the
+same test).
+
+### Finding 4: static config-file support for a real PMCH1 (`embms.nof_pmch`,
+### `embms.pmch1.*`) — closing the last structural gap from the previous section
+
+The previous section's "PMCH1+ session-to-TEID routing" follow-up was implemented
+(`resolve_pmch_sessions()`, `compose_mch_lcid()`) but only reachable via the live
+control socket — and `gtpu.cc`'s `m1u_handler` only ever learns per-PMCH
+`session_teids` once, at `gtpu::init()`, long before the control socket starts
+listening. So a live-added PMCH1 could be signalled correctly but never actually
+*receive* a real session's M1-U data, only ever the fabricated placeholder — the
+central thing this whole effort was for remained unverified.
+
+Added `embms.nof_pmch` (1-2 — only one extra PMCH is configurable via the static file;
+more still needs the live socket) and `embms.pmch1.{mcs,session_teids,
+time_interleaving_n,time_interleaving_m,nof_mbms_sessions}` as real startup options
+(`main.cc`), validated the same way their PMCH0 equivalents already are
+(`enb_cfg_parser.cc`), pushed into both `embms_args_t::extra_pmch` (reaches
+`gtpu_args`) and `rrc_cfg_t::extra_pmch` at parse time. Commit `bfba93d` (rt-mbms-tx).
+
+**Live-verified end to end for the first time this campaign**: a real BM-SC content
+session (`bmsc.conf`'s `[content_session]`, distinct from the always-on SACH — TMGI
+901:56:000010, `c_teid=52428`/`0xCCCC`, service ID 16 chosen deliberately outside TS
+24.116 clause 6.3.3's reserved 0..15 range for Receive-Only-Mode Service-Announcement
+TMGIs, same PLMN as the SACH per that same clause — an early attempt wrongly moved it
+to a different PLMN entirely before checking the actual spec text, corrected once it
+was), configured via `enb_baseline.conf`'s new `session_teids=0xbbbb` (SACH) /
+`nof_pmch=2` / `pmch1.session_teids=0xCCCC`, signalled correctly and only on PMCH1
+(confirmed via `sib_info`, not duplicated onto PMCH0 once Finding 3 was fixed), its
+bearer registered (Finding 1), delivered via M1-U without being dropped (Finding 2),
+and decoded by the modem at BLER 0.0 — alongside the SACH decoding independently on
+PMCH0, also at BLER 0.0. `mch_info`'s `dest` field stayed empty for PMCH1's session
+even once it was decoding correctly (PMCH0's own entry showed the SACH's real
+`224.0.0.120:55555` throughout) — not chased further; likely a pre-existing
+client-side display gap scoped to tracking one MCH's traffic, separate from everything
+above.
+
+One operational note worth recording: sending multiple `SET` commands to the control
+socket batched through one `nc` invocation (piped via a single `printf`) silently
+dropped some of them in practice (confirmed twice — once for the CAS-muting keys, once
+for `pmch1.time_interleaving_n`) even though every command returned `OK` individually
+when re-sent one at a time. Always verify with `GET` after a batched `SET`, or just
+send one command per `nc` call.
+
+### TI + CAS-muting interaction, on a real PMCH1 session, for the first time
+
+The previous section's last open follow-up. Live-set `embms.k_cas=8`,
+`embms.n_cas=4`, `embms.cas_muting=true`, `embms.pmch1.time_interleaving_n=2`,
+`embms.pmch1.time_interleaving_m=4` (one `nc` call each, per the note above) against
+the same real-content-session-on-PMCH1 setup from Finding 4. Decoded `sib_info`
+confirmed both took effect (`sib1.cas_muting_enabled=true, k_cas=8, n_cas=4`;
+`mcch.pmch_list[1].time_interleaving_n=2, .time_interleaving_m=4`) — SIB1's own CAS-
+muting fields needed a noticeably longer propagation wait than MCCH's own
+modification-period cycle (~25s total from the first `SET` to confirmed decode, vs the
+usual ~7-8s for MCCH-signalled changes) before showing up, not a failure, just a slower
+path. Sustained BLER 0.0 on both PMCH0 and PMCH1 across a 30-second polling window
+with both features active simultaneously alongside the real content session — the
+combination this whole follow-up existed to test, now confirmed clean.
+
+### Also fixed: cosmetic log noise, and a defensive bounds guard on the modem
+
+`configure_mbms_bearers()` being safely callable more than once (needed for Finding 1's
+fix) meant `bearer_manager` logging `"EPS bearer ID %d ... already registered"` at
+**ERROR** level on every single MCCH repack for any already-known bearer — harmless,
+but noisy enough to trip alerting in a real deployment. Fixed by tracking
+already-registered composite ids (`rrc::_registered_mbms_bearers`) and skipping them
+outright, ordered so a genuinely over-budget config (composite exceeding
+`PMCH_LCID_MAX_COMPOSITE`) still re-logs every call rather than going silent after the
+first occurrence. Commit `618cde7` (rt-mbms-tx).
+
+Separately, on the modem: `MbsfnFrameProcessor::set_cell()`/`CasFrameProcessor::
+set_cell()` handed `cell.nof_prb`/`mbsfn_prb` straight to `srsran_ue_dl_set_cell_scs()`
+with no check against `MAX_PRB`, the fixed size `_ue_dl`'s own buffers were allocated
+at. Nothing today can request more than 40 PRB (`pmch-Bandwidth-r17`'s real ASN.1
+range, TS 36.331 clause 6.3.7, checked directly — comfortably under `MAX_PRB=100`),
+but `modem_zmqtest.conf`'s `mbsfn_prb_test_override` is an operator-set debug value
+with no such ceiling, so this was a real boundary, not a hypothetical one. Both now
+clamp-and-log instead of silently overflowing. Live-verified: no regression on a full
+modem restart, both PMCHs still decoding at BLER 0.0. Commit `1c518b3` (rt-mbms-modem).
+
+### Also fixed: MCH0/MCH1 dashboard colors too close to tell apart
+
+Found while visually spot-checking the Subframe Activity panel during this pass: the
+golden-angle hue rotation (added when the panel first became per-PMCH-aware) started
+from green (PMCH0, hue 120°) and put PMCH1 at 137.5° — distinct enough to satisfy "no
+two colors are ever identical," but close enough to read as "a slightly different
+green" rather than a clearly separate color at a glance. Cross-checked against the raw
+`subframe_log` before concluding anything was actually wrong: PMCH1's activity was
+there and correctly attributed the whole time (`('MCH', 'IDLE', 1)` / `('MCH', 'OK',
+1)` counts distinct from PMCH0's own) — this was a colour-legibility issue, not a
+data-correctness one. Hand-picked green/teal for indices 0/1 (the only two ever
+realistically configured on this rig) instead of pure procedural generation; the
+golden-angle fallback for any further index now starts from teal rather than from
+green. Commit `416b460` (rt-mbms-application).
+
+### Status
+
+Every follow-up the previous section left open is now closed: real (non-fabricated)
+session delivery to PMCH1 confirmed end-to-end, the TI+CAS-muting interaction
+confirmed on a real PMCH1 session, and the modem-side `MAX_PRB` guard added. Three
+real, independent bugs found via live testing this pass (not just the ones this
+section set out to find) — all fixed, all re-verified live, none left as "probably
+fine." The one spec-compliance question raised along the way (Finding 2) was checked
+against primary text rather than assumed, twice over: once for the eps-BearerID
+ceiling itself, once for the reserved TMGI Service-ID range hit while setting up the
+test session.
+
+**Remaining, not chased this pass**: `mch_info`'s empty `dest` field for PMCH1's real
+session (noted above, likely a narrow pre-existing client-side gap); the `nc`
+batched-SET reliability issue (operational note above, workaround known, root cause in
+`nc`'s own pipelining vs. the control socket's line protocol not isolated).
