@@ -150,11 +150,18 @@ start() {
   # samples are already scrambled when independently re-FFT'd, with no wire/RX system
   # involved at all - narrowing the still-open root cause to the live srsenb process's
   # actual IFFT execution.
-  # TEMPORARY 2026-07-21: PMCH_TI_DIAG added to check whether Gw::write_pdu_mch() is
-  # even reaching PMCH1's real content session's traffic, and whether it looks like
-  # valid IP/UDP (mch_info's dest field stays empty for PMCH1 despite BLER 0.0 decode --
-  # investigating whether that's this dest-extraction path never firing/matching for
-  # PMCH1, or something else). Remove once settled either way.
+  # PMCH_TI_DIAG (added 2026-07-21): the original question it was added for
+  # (was Gw::write_pdu_mch() even reaching PMCH1's session?) is settled --
+  # root-caused to a real cross-PMCH buffer-state bug (fixed, see
+  # SIB13_MBSFN_TEST_RESULTS.md) and separately to PMCH1 having no real
+  # content source at all (expected, not a bug). Kept active: still useful,
+  # cheap, general-purpose per-PMCH visibility (TI_DIAG_ADDBEARER/GWMCH/
+  # MACSDU), not just a narrow one-off check anymore.
+  # CPU_MIGRATION_DIAG (added 2026-07-21): re-testing the EVM ripple's
+  # residual cause (main_thread_priority_rt fix only partially explained it)
+  # with per-occasion CPU core + frequency sampling, inline at decode time --
+  # sub-millisecond-accurate, unlike the original ~300ms external polling
+  # that made the same hypothesis inconclusive the first time.
   # PMCH_RE_DUMP removed 2026-07-21: found still active despite the "removed
   # 2026-07-19" note above -- it was re-added at some point (its RX FAIL-DUMP site's
   # own comment mentions reuse "for the 2026-07 CAS-muting sf=0 investigation") and
@@ -166,7 +173,7 @@ start() {
   # harmful, per-subframe disk I/O" pattern already root-caused as a SYNC_OFFSET_DIAG
   # SLOWCALL contributor on 2026-07-19. Not needed for the PMCH1 investigation above
   # (that uses PMCH_TI_DIAG's own TI_DIAG_MACSDU/TI_DIAG_GWMCH lines, a separate gate).
-  nsrun_root Modem  "$CONF"    "env CAS_CE_DIAG=1 MCH_DIAG=1 PMCH_TI_DIAG=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
+  nsrun_root Modem  "$CONF"    "env CAS_CE_DIAG=1 MCH_DIAG=1 PMCH_TI_DIAG=1 CPU_MIGRATION_DIAG=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
 
   # The modem creates $TUN_DEV but leaves it DOWN with no address. Wait for it,
   # then bring it up, give it CLIENT_IFACE (the client binds its FLUTE receiver to
