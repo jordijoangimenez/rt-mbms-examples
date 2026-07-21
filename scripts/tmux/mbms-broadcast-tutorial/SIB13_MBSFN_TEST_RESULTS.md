@@ -2130,5 +2130,55 @@ is live and correct as a matter of hygiene regardless, but bumps clearly still o
 at least occasionally with it in place. A real verdict needs a longer, comparable-
 duration observation window against the original 2026-07-20 numbers, not yet done.
 
-**MTCH SLOWCALL timing item**: not re-checked this pass (would need a live wideband
-MTCH failure case to re-trigger and observe; not attempted).
+**MTCH SLOWCALL timing item**: confirmed not testable right now, not just "not
+attempted." Zero `SLOWCALL` entries anywhere in the current log — the mechanism only
+fires during actual wideband MTCH decode attempts, and since PMCH1 has no real content
+source (see the conclusion above), that code path is never exercised at all. Needs the
+same real content source as a genuine PMCH1 delivery test before this can be
+re-checked either way.
+
+### EVM ripple (hypothesis 6): longer window gathered — real, measurable improvement,
+### but not a full fix
+
+Waited for 201 fresh `MCCHDIAG` samples (106s at this cell's actual MCCH occasion
+rate — much faster than the earlier 30-sample spot-check's rough rate estimate
+suggested), a larger sample than the original investigation's 81. Full distribution:
+
+```
+n=201, mean=5.36%, median=5.25%, min=4.31%, max=8.07%, stdev=0.42pp
+Histogram (rounded to nearest 1%): 4%: 2, 5%: 173, 6%: 21, 7%: 4, 8%: 1
+15/201 samples (7.5%) land >15% above the median (6.04%+) - by the same
+"elevated occasion" framing the original investigation used.
+```
+
+Compared against the original 2026-07-20 numbers (`main_thread_priority_rt=0`,
+"rock-stable ~4.66% baseline... jumps intermittently to 4.7-16.3%"):
+- The steady-state level is essentially unchanged (5.25% now vs. ~4.66% then - close
+  enough to be ordinary day-to-day/measurement variance, not a meaningful shift).
+- Bumps are still clearly present (7.5% of samples elevated) - **the ripple has not
+  been eliminated**.
+- But bump *magnitude* dropped substantially: worst case now is 8.07%, versus a
+  documented 16.3% before - roughly half, and **zero** samples this pass reached even
+  10%, let alone the previous max.
+
+**Honest conclusion**: `main_thread_priority_rt=20` is a real, measurable partial
+contributor - it did not fully explain the ripple (something else is still producing
+smaller bumps), but the worst-case severity dropped by roughly half in a sample this
+size. Treat as confirmed-partial, not confirmed-complete: there is likely a second,
+still-unidentified contributor stacking with (or independent of) whatever the
+scheduling fix addressed. Not chased further this pass - a reasonable next step would
+be re-running hypothesis 3 (CPU frequency/migration) with proper sub-millisecond
+resolution now that this confound is out of the way, since the coarse 300ms polling
+that made it "inconclusive" the first time might resolve more cleanly against this
+smaller residual effect.
+
+### Status of this continuation
+
+All originally-pending items now have a definitive answer: PMCH1 delivery gap =
+not a bug (root-caused, no code change needed); `nc` batched-SET = already fixed;
+EVM ripple = one real partial contributor found and fixed, residual not yet
+explained; MTCH SLOWCALL = confirmed blocked on the same missing-content-source
+prerequisite as a real PMCH1 delivery test. eNB/MBMS-GW/BM-SC restart (needed to
+clear their own ~6h+ uptime and get a fully clean baseline) could not be performed
+this pass - blocked by the same restart-approval gate as the modem, needs to be run
+directly by a human operator.
