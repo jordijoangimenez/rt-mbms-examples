@@ -116,9 +116,6 @@ start() {
   # muting investigation. Keep only what THAT investigation needs live.
   # RACE_DIAG2 removed 2026-07-18: that investigation (CAS-muting sf=0 anomaly,
   # Finding 3) is fixed and live-verified, see SIB13_MBSFN_TEST_RESULTS.md.
-  # TEMPORARY 2026-07-18: SOFTBUFFER_DIAG to confirm/rule out whether the RX
-  # softbuffer-size rejection (sch.c) is firing during the wideband pmch_bandwidth
-  # MTCH decode failure (Finding 4 continuation) -- remove once that's settled.
   # -b sets the cell-search-phase PRB assumption (cs_nof_prb = file_bw*5,
   # main.cpp:419-420) -- it ALWAYS wins over -p/--override_nof_prb in that
   # ternary regardless of live-SDR vs file mode (confirmed 2026-07-18; a
@@ -131,10 +128,45 @@ start() {
   # n_prb=75 test's base_srate=23.04e6). Keep this in lockstep with
   # enb_baseline.conf's n_prb/base_srate and modem_zmqtest.conf's
   # native_srate whenever testing a non-default n_prb.
-  # TEMPORARY 2026-07-18: PMCH_CE_DIAG to pinpoint where the wideband-PMCH
-  # channel-estimate NaN actually originates (post-pmch_get extraction vs
-  # later equalization) - remove once that investigation concludes.
-  nsrun_root Modem  "$CONF"    "env MCH_DIAG=1 ZMQRX_RATIO_DIAG=1 SYNC_OFFSET_DIAG=1 SOFTBUFFER_DIAG=1 PMCH_CE_DIAG=1 RACE_DIAG2=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
+  # SOFTBUFFER_DIAG/PMCH_CE_DIAG/PMCH_RE_DUMP removed 2026-07-19: all three were
+  # "TEMPORARY 2026-07-18" flags from the wideband-pmch_bandwidth MTCH investigation,
+  # never cleaned up once it moved on. PMCH_RE_DUMP specifically has a fail-triggered
+  # dump site (pmch.c's RX FAIL-DUMP, deliberately NOT tti-gated, "bounded by rarity"
+  # per its own comment) that turned actively harmful once decode failures stopped
+  # being rare: it was firing on nearly every subframe, and the resulting per-subframe
+  # disk I/O is a strong candidate for the chronic SYNC_OFFSET_DIAG SLOWCALL overruns
+  # (~11-12ms against a 1ms budget) observed 2026-07-19 while investigating why CAS/
+  # PDCCH decode had stalled entirely (see SIB13_MBSFN_TEST_RESULTS.md). Re-add
+  # individually if a specific investigation needs one again.
+  # RAW_IQ_DUMP (ue_dl.c) and PSS_KNOWN_DIAG (CasFrameProcessor.cpp) added 2026-07-19
+  # while chasing the wideband (mbsfn_prb != nof_prb) CAS/PDCCH phase-scrambling
+  # anomaly - both cheap (one-shot / ~8 lines per CAS-with-PSS occasion) and
+  # confirmed genuinely useful: PSS_KNOWN_DIAG in particular is what proved the
+  # scrambling is NOT CRS-specific (PSS, a completely independent known reference
+  # signal, shows the exact same magnitude-preserved/phase-scrambled pattern).
+  # TX_TIME_DUMP/RX_TIME_DUMP (enb_dl.c/ue_dl.c, off by default here - need matching
+  # TX_TIME_DUMP_TTI on the eNB's own launch line too, see SIB13_MBSFN_TEST_RESULTS.md)
+  # are the sharpest remaining diagnostic: they proved the eNB's OWN transmitted
+  # samples are already scrambled when independently re-FFT'd, with no wire/RX system
+  # involved at all - narrowing the still-open root cause to the live srsenb process's
+  # actual IFFT execution.
+  # TEMPORARY 2026-07-21: PMCH_TI_DIAG added to check whether Gw::write_pdu_mch() is
+  # even reaching PMCH1's real content session's traffic, and whether it looks like
+  # valid IP/UDP (mch_info's dest field stays empty for PMCH1 despite BLER 0.0 decode --
+  # investigating whether that's this dest-extraction path never firing/matching for
+  # PMCH1, or something else). Remove once settled either way.
+  # PMCH_RE_DUMP removed 2026-07-21: found still active despite the "removed
+  # 2026-07-19" note above -- it was re-added at some point (its RX FAIL-DUMP site's
+  # own comment mentions reuse "for the 2026-07 CAS-muting sf=0 investigation") and
+  # never taken back out. Its RX FAIL-DUMP site (pmch.c:1078) writes a real file
+  # (fopen/fwrite/fclose of the failed LLR buffer) on every CRC failure, unconditionally
+  # -- it does NOT go through the pmch_re_dump_enabled()/PMCH_RE_DUMP_TTI tti-filter
+  # that gates its other dump sites. MTCH decode still mostly fails at this pass's
+  # wideband config, so this was firing on most subframes -- the exact "actively
+  # harmful, per-subframe disk I/O" pattern already root-caused as a SYNC_OFFSET_DIAG
+  # SLOWCALL contributor on 2026-07-19. Not needed for the PMCH1 investigation above
+  # (that uses PMCH_TI_DIAG's own TI_DIAG_MACSDU/TI_DIAG_GWMCH lines, a separate gate).
+  nsrun_root Modem  "$CONF"    "env CAS_CE_DIAG=1 MCH_DIAG=1 PMCH_TI_DIAG=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
 
   # The modem creates $TUN_DEV but leaves it DOWN with no address. Wait for it,
   # then bring it up, give it CLIENT_IFACE (the client binds its FLUTE receiver to
@@ -195,6 +227,14 @@ stop() {
   ip netns pids "$NS" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
   ip netns del "$NS" 2>/dev/null || true
   ip link del vrx0 2>/dev/null || true
+  # The modem creates $TUN_DEV itself (not this script), and it does not appear to
+  # be reliably removed just by deleting the netns it was created in - confirmed
+  # live 2026-07-19: it can persist (state DOWN, orphaned) across a stop/start
+  # cycle, and a fresh modem process then fails to (re)create a device with the
+  # same name. Without this, that failure was silently fatal (crash on startup,
+  # no clear error in the log) on every subsequent start until this stale
+  # interface was manually removed.
+  ip link del "$TUN_DEV" 2>/dev/null || true
   echo "Receive netns '$NS' and veth torn down."
 }
 
