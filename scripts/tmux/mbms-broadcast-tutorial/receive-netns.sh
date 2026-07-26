@@ -52,6 +52,7 @@ nsrun() { # nsrun <Name> <workdir> <command string>  -- run as the unprivileged 
   ip netns exec "$NS" runuser -u "$USER_NAME" -- \
     env HOME="$UH" PATH="/usr/local/bin:/usr/bin:/bin" SOAPY_SDR_PLUGIN_PATH="$SOAPY_DIR" \
     nohup bash -c "cd '$workdir' && exec $*" > "$LOG/$name.log" 2>&1 &
+  disown
   echo "  $name launched in netns '$NS'  (log: $LOG/$name.log)"
 }
 
@@ -64,6 +65,7 @@ nsrun_root() { # nsrun_root <Name> <workdir> <command string>  -- run as ROOT
   ip netns exec "$NS" \
     env HOME="$UH" PATH="/usr/local/bin:/usr/bin:/bin" SOAPY_SDR_PLUGIN_PATH="$SOAPY_DIR" \
     nohup bash -c "cd '$workdir' && exec $*" > "$LOG/$name.log" 2>&1 &
+  disown
   chown "$USER_NAME": "$LOG/$name.log" 2>/dev/null || true
   echo "  $name launched in netns '$NS' (root, for TUN)  (log: $LOG/$name.log)"
 }
@@ -173,7 +175,12 @@ start() {
   # harmful, per-subframe disk I/O" pattern already root-caused as a SYNC_OFFSET_DIAG
   # SLOWCALL contributor on 2026-07-19. Not needed for the PMCH1 investigation above
   # (that uses PMCH_TI_DIAG's own TI_DIAG_MACSDU/TI_DIAG_GWMCH lines, a separate gate).
-  nsrun_root Modem  "$CONF"    "env CAS_CE_DIAG=1 MCH_DIAG=1 PMCH_TI_DIAG=1 CPU_MIGRATION_DIAG=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
+  # CFO_FEEDBACK_DISABLE=1 tried and reverted 2026-07-26: 5/5 crashes (external SIGKILL,
+  # RLIMIT_RTTIME=200ms) -- disabling CFO feedback entirely appears to worsen tracking
+  # enough to push cell-search/re-acquisition into a non-yielding real-time busy stretch.
+  # Replaced with a more surgical fix: Phy::set_cell() now scales cfo_loop_bw_ref down
+  # for mixed-mode cells instead of disabling feedback outright (see Phy.cpp comment).
+  nsrun_root Modem  "$CONF"    "env CAS_CE_DIAG=1 MCH_DIAG=1 PMCH_TI_DIAG=1 CPU_MIGRATION_DIAG=1 SYNC_FAIL_DIAG=1 SYNC_OFFSET_DIAG=1 CAS_TIMING_DIAG=1 '$MODEM' -c '$MODEM_NS_CONF' -b 10 -l 2 -s 4"
 
   # The modem creates $TUN_DEV but leaves it DOWN with no address. Wait for it,
   # then bring it up, give it CLIENT_IFACE (the client binds its FLUTE receiver to
