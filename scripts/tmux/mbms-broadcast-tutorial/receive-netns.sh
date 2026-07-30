@@ -189,9 +189,10 @@ start() {
   # packets (rp_filter off so the arrival interface isn't reverse-path-dropped).
   echo "Waiting for $TUN_DEV (modem creates it on start) ..."
   tun_ok=0
-  # 45s, not the original 20s: on this sandbox's (slower/contended) CPU, cell
-  # search + sync can take ~25-30s before the modem creates the TUN device.
-  for _ in $(seq 1 45); do
+  # 90s, not the original 20s: on this sandbox's (slower/contended) CPU, the
+  # bandwidth-blind cell search (6-PRB blind scan, added 2026-07-26) can take
+  # ~50-60s before the modem creates the TUN device -- confirmed live, twice.
+  for _ in $(seq 1 90); do
     if ip netns exec "$NS" ip link show "$TUN_DEV" >/dev/null 2>&1; then tun_ok=1; break; fi
     sleep 1
   done
