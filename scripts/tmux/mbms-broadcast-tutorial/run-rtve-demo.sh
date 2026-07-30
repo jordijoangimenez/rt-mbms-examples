@@ -6,7 +6,7 @@
 #
 # Covers, in order:
 #   1. Stop any previous run (idempotent -- safe to re-run any time)
-#   2. Transmit side: EPC, UL-Feeder, eNB, MBMS-GW, BM-SC
+#   2. Transmit side: EPC, eNB, MBMS-GW, BM-SC
 #   3. Application Provider (xMB control portal, http://127.0.0.1:8080)
 #   4. Receive side: modem, client, Application/WUI (http://<rx-ip>:3000),
 #      inside the mbms-rx network namespace
@@ -57,7 +57,7 @@ log() { echo; echo "=== $* ==="; }
 # -----------------------------------------------------------------------
 log "Stopping any previous run"
 sudo -n "$SCRIPT_DIR/receive-netns.sh" stop >/dev/null 2>&1
-for b in srsenb ul-feeder mbms-gw bmsc; do sudo -n pkill -x "$b" 2>/dev/null; done
+for b in srsenb mbms-gw bmsc; do sudo -n pkill -x "$b" 2>/dev/null; done
 pkill -f 'node --env-file=.env server.js' 2>/dev/null
 pkill -f 'node hls-http-proxy.js' 2>/dev/null
 sudo -n pkill -x srsepc 2>/dev/null
@@ -70,10 +70,6 @@ log "Launching transmit chain: EPC"
 sudo -n bash -c "cd '$CONF' && exec nohup '$TX_DIR/build/srsepc/src/srsepc' epc.conf" > "$LOG_DIR/EPC.log" 2>&1 &
 disown -a
 sleep 2
-
-log "Launching transmit chain: UL-Feeder"
-( cd "$CONF" && exec nohup "$SCRIPT_DIR/tools/ul-feeder" "tcp://*:2001" > "$LOG_DIR/UL-Feeder.log" 2>&1 & )
-sleep 1
 
 log "Launching transmit chain: eNB"
 ( cd "$CONF" && exec nohup "$TX_DIR/build/srsenb/src/srsenb" enb_baseline.conf > "$LOG_DIR/eNB.log" 2>&1 & )
@@ -132,12 +128,14 @@ fi
 
 log "Waiting for the modem's TUN device ($TUN_DEV)"
 tun_ok=0
-for _ in $(seq 1 60); do
+# 90s: on this sandbox's (slower/contended) CPU, cell search + sync can take
+# ~50-60s before the modem creates the TUN device (confirmed live, repeatedly).
+for _ in $(seq 1 90); do
   sudo -n ip netns exec mbms-rx ip link show "$TUN_DEV" >/dev/null 2>&1 && { tun_ok=1; break; }
   sleep 1
 done
 if [ "$tun_ok" != 1 ]; then
-  echo "WARNING: $TUN_DEV never appeared after 60s -- check $LOG_DIR/Modem.log"
+  echo "WARNING: $TUN_DEV never appeared after 90s -- check $LOG_DIR/Modem.log"
   echo "         (attempting to configure it anyway, in case it appears moments later)"
 fi
 {
